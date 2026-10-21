@@ -1,0 +1,60 @@
+{
+  "model": "ARX L5",
+  "upstream_repository": "https://github.com/google-deepmind/mujoco_menagerie",
+  "upstream_directory": "arx_l5",
+  "upstream_commit": "71f066ad0be9cd271f7ed58c030243ef157af9f4",
+  "upstream_url": "https://github.com/google-deepmind/mujoco_menagerie/tree/71f066ad0be9cd271f7ed58c030243ef157af9f4/arx_l5",
+  "license": "BSD-3-Clause",
+  "original_repository": "https://github.com/ARXroboticsX/ARX_Model",
+  "original_commit": "af6fe43c873008a85bce6195c0f2160f1a1c14ce",
+  "files": {
+    "arx_l5.xml": {
+      "sha256": "5d83116bda7378b6c247f3f93a0b27d6174057fcb86ce37418d1bee60bde735c",
+      "bytes": 6910
+    },
+    "LICENSE": {
+      "sha256": "11b6d7cd3c80b5eda4974f4fde6c08ec4c142bd9cb66f1b854974c25dab9cf22",
+      "bytes": 1503
+    },
+    "assets/base_link.obj": {
+      "sha256": "04c95ecfcf001d3bcd43190cca1c5443e98f986a1e57c2ddee7bd28da9d67e09",
+      "bytes": 831334
+    },
+    "assets/camera.obj": {
+      "sha256": "1add87c2a03f996ed5304f97ed24a56294d5d32720fda6783a02041c5c03c8f7",
+      "bytes": 835733
+    },
+    "assets/link1.obj": {
+      "sha256": "01243ee80f060fe6858e559bcdc5bd2f9b015c018531779b7fb1cd8246a17bd0",
+      "bytes": 379622
+    },
+    "assets/link2.obj": {
+      "sha256": "ade60370ac720c1489ecc1806faf265cc49fd5be4a6057e0b93b7da4c5c398ba",
+      "bytes": 1933493
+    },
+    "assets/link3.obj": {
+      "sha256": "43d475ae678a232921da37c893bdfbf2524383622f89808ec356595b134c5525",
+      "bytes": 2144530
+    },
+    "assets/link4.obj": {
+      "sha256": "d616632897d7d17fa499423e87f36b9401ec54f117a99685b131989f1b2ce670",
+      "bytes": 406200
+    },
+    "assets/link5.obj": {
+      "sha256": "ebcc9e83c49d40900f1e5be332db697e47d4f3c9c45555817f6d74abf5b9dd2f",
+      "bytes": 2301371
+    },
+    "assets/link6.obj": {
+      "sha256": "57957e2a042277526ad29d84c608993431a1bdd9b19f71a24d2d161215f27587",
+      "bytes": 1944757
+    },
+    "assets/link7.obj": {
+      "sha256": "e74face53b21d37e21a1301707b13b866c58e8edc4212309a22a3350e48dcb56",
+      "bytes": 279721
+    },
+    "assets/link8.obj": {
+      "sha256": "370731b0450addefe6c6d494dc2ac0246259c8a286d532ea5c225750ecd66740",
+      "bytes": 285359
+    }
+  }
+}
