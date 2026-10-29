@@ -1,2 +1,6 @@
 __pycache__/
-training_data/
+*.py[cod]
+
+# Generated datasets and user-requested runtime output.
+/training_data/
+/outputs/

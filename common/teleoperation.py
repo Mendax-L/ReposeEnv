@@ -1,4 +1,4 @@
-"""Human collection with complete physical landing and native-resolution previews."""
+"""Human collection with direct tool control and native-resolution previews."""
 from __future__ import annotations
 
 import json
@@ -8,11 +8,12 @@ from pathlib import Path
 from time import perf_counter
 import numpy as np
 from .recording import EpisodeRecorder
+from .schema import SUPPORTED_ENVIRONMENTS
 
 
 class DemonstrationSession:
     def __init__(self, environment, writer, seed=0, max_steps=3000):
-        if environment.name not in ("pusht", "pushbox2d", "pushbox3d"):
+        if environment.name not in SUPPORTED_ENVIRONMENTS:
             raise ValueError("Unknown push environment.")
         if max_steps < 1:
             raise ValueError("max_steps must be positive.")
@@ -28,7 +29,7 @@ class DemonstrationSession:
 
     @property
     def spatial(self):
-        return self.environment.name == "pushbox3d"
+        return self.environment.name == "alignbox3d"
 
     @property
     def saving(self):
@@ -41,7 +42,7 @@ class DemonstrationSession:
     def enable_background_saving(self):
         """Keep encoding and disk writes off the GUI thread; one episode at a time."""
         if self._save_executor is None:
-            self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pushenv-save")
+            self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reposeenv-save")
 
     def reset(self):
         if self.saving:
@@ -60,9 +61,10 @@ class DemonstrationSession:
             return
         self.active = True if self.finishing else not self.active
 
-    def action(self, mouse=None, direction=(0, 0), yaw=0.):
+    def action(self, mouse=None, direction=(0, 0), yaw=0., rotation=(0., 0., 0.), arm="both", gripper=None):
         if self.spatial:
-            return self.controller.act(mouse=mouse, direction=direction, yaw=yaw)
+            return self.controller.act(mouse=mouse, direction=direction, yaw=yaw,
+                                       rotation=rotation, arm=arm, gripper=gripper)
         return self.controller.act(mouse=mouse, direction=direction)
 
     def step(self, action):
@@ -82,7 +84,7 @@ class DemonstrationSession:
         return None
 
     def discard(self):
-        """Land a started 3-D attempt before discarding it; reuse its seed."""
+        """End a started attempt before discarding it; reuse its seed."""
         if self.saving:
             return
         if self.spatial and self.recorder.frames:
@@ -92,7 +94,7 @@ class DemonstrationSession:
             self.reset()
 
     def save(self, reason="manual_save"):
-        """Finish a 3-D episode physically before committing its data."""
+        """End a 3-D episode at its current pose before committing its data."""
         if self.saving or not self.recorder.frames:
             return None
         if self.spatial:
@@ -158,12 +160,12 @@ class DemonstrationSession:
             return self.poll_save(wait=True)
         if self.spatial and self.finishing:
             for _ in range(60 * self.environment.fps):
-                result = self.step(np.zeros(self.environment.action_dim, dtype=np.float32))
+                result = self.step(self.environment.hold_action())
                 if self.saving:
                     return self.poll_save(wait=True)
                 if not self.finishing:
                     return result
-            raise RuntimeError("Physical landing did not finish within 60 seconds of simulation.")
+            raise RuntimeError("Episode completion did not finish within 60 seconds of simulation.")
         return result
 
     def close(self):
@@ -178,20 +180,12 @@ class DemonstrationSession:
                 self.recorder.close()
 
 
-def lift_readiness(session):
-    """Separate the automatic opening lift from permission to use XY keys."""
-    phase = session.last_info.get("phase", "lifting")
+def control_readiness(session):
     if session.saving:
-        return "本条已结束；正在统计、编码和保存，XY / yaw 操作已锁定"
-    if phase == "control":
-        return ("抬升已完成；可以开始 XY / yaw 操作" if session.active else
-                "抬升已完成；当前暂停，按空格开始 XY / yaw 操作")
-    if phase == "lifting":
-        return ("抬升未完成；请等待，暂不能操作 XY / yaw" if session.active else
-                "抬升未完成；按空格开始抬升，暂不能操作 XY / yaw")
-    if phase in ("lowering", "settling", "complete"):
-        return "抬升已完成；正在落放或落稳，XY / yaw 操作已锁定"
-    return "本条操作失败；XY / yaw 操作已锁定"
+        return "本条已结束；正在统计、编码和保存"
+    if session.last_info.get("phase", "control") == "control":
+        return "末端控制已就绪" if session.active else "按空格开始末端控制"
+    return "本条已结束；末端操作已锁定"
 
 
 def run_window(session, episode_limit=0):
@@ -200,6 +194,7 @@ def run_window(session, episode_limit=0):
     pygame.init()
     session.enable_background_saving()
     spatial = session.spatial
+    selected_arm = "both"
     screen = pygame.display.set_mode((1024, 720) if spatial else (512, 660))
     pygame.display.set_caption(f"{session.environment.name} | Human demonstrations | LeRobot")
     font = pygame.font.Font(None, 23)
@@ -224,6 +219,8 @@ def run_window(session, episode_limit=0):
                     if event.key == pygame.K_SPACE:
                         session.toggle()
                         next_tick = pygame.time.get_ticks() + period_ms
+                    elif spatial and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                        selected_arm = {pygame.K_1: "inner", pygame.K_2: "outer", pygame.K_3: "both"}[event.key]
                     elif event.key == pygame.K_RETURN:
                         session.save()
                     elif event.key == pygame.K_r and not session.finishing and not session.saving:
@@ -241,7 +238,7 @@ def run_window(session, episode_limit=0):
                     keys = pygame.key.get_pressed()
                     mouse = None
                     yaw = float(int(keys[pygame.K_e]) - int(keys[pygame.K_q])) if spatial else 0.
-                    if session.environment.name in ("pushbox2d", "pushbox3d"):
+                    if session.spatial:
                         direction = (int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]),
                                      (int(keys[pygame.K_UP]) - int(keys[pygame.K_DOWN])) if spatial else
                                      (int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])))
@@ -251,7 +248,18 @@ def run_window(session, episode_limit=0):
                         x, y = pygame.mouse.get_pos()
                         if pygame.mouse.get_pressed()[0] and 0 <= x < 512 and 0 <= y < 512:
                             mouse = (x, y)
-                    session.step(session.action(mouse=mouse, direction=direction, yaw=yaw))
+                    if spatial:
+                        direction = (*direction, int(keys[pygame.K_PAGEUP]) - int(keys[pygame.K_PAGEDOWN]))
+                        rotation = (int(keys[pygame.K_i]) - int(keys[pygame.K_k]),
+                                    int(keys[pygame.K_l]) - int(keys[pygame.K_j]), 0.)
+                        grip_direction = int(keys[pygame.K_o]) - int(keys[pygame.K_p])
+                        openings = session.environment.environment.hold_action().reshape(2, 7)[:, 6]
+                        openings = np.clip(openings + grip_direction * .02, 0., 1.)
+                        session.step(session.action(direction=direction, yaw=yaw,
+                                                    rotation=rotation, arm=selected_arm,
+                                                    gripper=openings))
+                    else:
+                        session.step(session.action(mouse=mouse, direction=direction))
                 next_tick += period_ms
                 if next_tick < now - period_ms:
                     next_tick = now + period_ms
@@ -280,20 +288,19 @@ def run_window(session, episode_limit=0):
                 screen.blit(font.render(label, True, (240, 240, 240)), (index * 512 + 8, 3))
             status = (f"SAVING ({session.saving_elapsed:.1f} s)" if session.saving else
                       "RECORDING" if session.active else "PAUSED - Space to start/resume")
-            controls = ("Arrows: XY | Q: CCW (-) | E: CW (+) | Z automatic: lift/land 20 mm" if spatial else
-                        "Grip center | Arrow keys: XY" if session.environment.name == "pushbox2d" else
+            controls = (f"{selected_arm} [1/2/3] | Arrows XY | PgUp/Dn Z | Q/E yaw | I/K rx | J/L ry | O/P grip" if spatial else
                         "Agent | hold left mouse or WASD")
             lines = [f"{status} | saved {session.saved} | frames {session.recorder.frames}", controls,
-                     "Space: start/pause | Enter: land + save" if spatial else
+                     "Space: start/pause | Enter: end + save" if spatial else
                      "Space: start/pause | Enter: save | R: discard/reset",
-                     "Esc: land + save + quit | R: discard/reset | aligned: auto-land + save" if spatial else
+                     "Esc: end + save + quit | R: discard/reset | aligned: save" if spatial else
                      "Esc: save partial + quit | success: auto-save + pause"]
             if spatial:
                 info = session.last_info
-                lines.append(f"Phase: {info.get('phase', 'lifting')} | XY error: {info.get('xy_error', 0) * 1000:.2f} mm"
+                lines.append(f"Phase: {info.get('phase', 'control')} | XY error: {info.get('xy_error', 0) * 1000:.2f} mm"
                              f" | yaw: {np.degrees(info.get('yaw', 0)):+.2f} deg"
-                             f" | Lift: {info.get('lifted_height', 0) * 1000:.2f}/20 mm | {info.get('failure_reason') or ''}")
-                lines.append(lift_readiness(session))
+                             f" | Z error: {info.get('height_error', 0) * 1000:.2f} mm | {info.get('failure_reason') or ''}")
+                lines.append(control_readiness(session))
             if session.last_result:
                 lines.append(f"Last episode: {'SUCCESS' if session.last_result['success'] else 'INCOMPLETE/FAILED'}"
                              f" | {session.last_result['frames']} frames")

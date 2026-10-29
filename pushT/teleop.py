@@ -7,7 +7,7 @@ def create_teleop(environment):
 
 
 def main():
-    from record import main as record_main
+    from common.recording import main as record_main
     record_main(default_env="pusht")
 
 

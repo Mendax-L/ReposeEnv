@@ -1,8 +1,8 @@
-"""Record supplied actions in a pushenv environment as a LeRobot dataset.
+"""Record supplied actions in a ReposeEnv environment as a LeRobot dataset.
 
 Example (the actions file must contain real user/controller commands)::
 
-    python record.py --env pusht --actions commands.npy \
+    python -m common.recording --env pusht --actions commands.npy \
         --output training_data/pusht_recorded --task "Push the T into its goal"
 
 ``record_episode`` expects an environment that has already been reset. Each row
@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
@@ -59,7 +59,7 @@ def recording_schema(environment: Any) -> dict[str, Any]:
 def _success(environment: Any, info: dict[str, Any]) -> tuple[bool, bool]:
     if "success" in info:
         return bool(info["success"]), True
-    if environment.name in ("pusht", "pushbox2d") and "coverage" in info:
+    if environment.name == "pusht" and "coverage" in info:
         coverage = float(info["coverage"])
         if not np.isfinite(coverage):
             raise ValueError("Native coverage must be finite when provided.")
@@ -125,7 +125,7 @@ class EpisodeRecorder:
         self.last_transition = transition
         return transition
 
-    def save(self, writer: Any, stop_reason: str) -> dict[str, Any]:
+    def save(self, writer: Any, stop_reason: str, *, task: str | Sequence[str] | None = None) -> dict[str, Any]:
         if not self.frames:
             raise ValueError("Cannot record an empty action source.")
         mapped = []
@@ -148,7 +148,7 @@ class EpisodeRecorder:
                 **{name: bool(batch[f"next.{name}"][-1, 0])
                    for name in ("terminated", "truncated", "success", "success_known")},
             }
-            writer.write_episode(batch)
+            writer.write_episode(batch, task=task)
             # Flush before releasing memory maps; the writer may otherwise keep
             # pending references until a later episode or close().
             if self._scratch is not None:
@@ -191,7 +191,7 @@ def record_episode(
         raise ValueError("max_steps must be a positive integer or None.")
     recorder = EpisodeRecorder(environment, buffer_dir=getattr(writer, "root", None))
     iterator = iter(actions)
-    if environment.name == "pushbox3d" and hasattr(environment, "request_finish"):
+    if environment.name == "alignbox3d" and hasattr(environment, "request_finish"):
         finishing = False
         stop_reason = "environment"
         try:
@@ -205,9 +205,9 @@ def record_episode(
                     except StopIteration:
                         environment.request_finish("actions_exhausted")
                         finishing = True
-                        supplied_action = np.zeros(environment.action_dim, dtype=np.float32)
+                        supplied_action = environment.hold_action()
                 else:
-                    supplied_action = np.zeros(environment.action_dim, dtype=np.float32)
+                    supplied_action = environment.hold_action()
                 transition = recorder.step(supplied_action)
                 if transition.done:
                     break
@@ -235,140 +235,6 @@ def record_episode(
         recorder.close()
 
 
-def record_straight_episode(
-    environment: Any,
-    writer: Any,
-    max_steps: int | None = None,
-    speed_m_s: float = 0.02,
-    yaw_speed_rad_s: float = float(np.deg2rad(10.)),
-) -> dict[str, Any]:
-    """Record a physical PushBox3D cycle using one fixed XY command direction.
-
-    The centre follows a fixed XY line while yaw turns towards zero. Opening
-    lift, landing and settling remain native physics stages. Actual box motion
-    is measured, never overwritten.
-    """
-    if environment.name != "pushbox3d" or environment.action_dim != 3:
-        raise ValueError("Straight-line collection requires PushBox3D with centre XY/yaw actions.")
-    if max_steps is not None and (type(max_steps) is not int or max_steps < 1):
-        raise ValueError("max_steps must be a positive integer or None.")
-    if not np.isfinite(speed_m_s) or not 0 < speed_m_s <= 0.001 * environment.fps:
-        raise ValueError("speed_m_s must be positive and at most 0.001 * fps metres per second.")
-    if getattr(environment, "_latest_observation", None) is None:
-        raise RuntimeError("Reset the environment before straight-line collection.")
-
-    from pushBox3D.native.model import GRIP_POINTS
-
-    native = environment.environment
-    if not np.isfinite(yaw_speed_rad_s) or not 0 < yaw_speed_rad_s <= native.yaw_action_scale * environment.fps:
-        raise ValueError("yaw_speed_rad_s must be positive and no larger than the yaw action speed limit.")
-    if native.phase in ("complete", "failed"):
-        raise RuntimeError("Reset the finished environment before collecting another episode.")
-    goal_grips = np.asarray(GRIP_POINTS, dtype=np.float64)[:, :2]
-    initial_xy = native.pose[0][:2].copy()
-    initial_yaw = float(native.pose[1])
-    goal_xy = np.zeros(2, dtype=np.float64)
-    box_line = goal_xy - initial_xy
-    box_line_squared = float(box_line @ box_line)
-    control_start = direction = None
-    command_distance = speed_m_s / environment.fps
-    limit = max_steps if max_steps is not None else native.max_steps
-    tail_limit = int(np.ceil(3 * native.stage_timeout_seconds * environment.fps)) + 3
-    recorder = EpisodeRecorder(environment, buffer_dir=getattr(writer, "root", None))
-    previous_xy = initial_xy.copy()
-    max_cross_track = actual_path_length = 0.0
-    phase_counts: dict[str, int] = {}
-    control_steps = 0
-    finish_at = None
-    stop_reason = "environment"
-    bounded_tail_exhausted = False
-    try:
-        while True:
-            if recorder.frames >= limit and finish_at is None:
-                environment.request_finish("max_steps" if max_steps is not None else "time_limit")
-                finish_at = recorder.frames
-            if native.finish_requested and finish_at is None:
-                finish_at = recorder.frames
-            if finish_at is not None and recorder.frames - finish_at >= tail_limit:
-                stop_reason = "tail_timeout"
-                bounded_tail_exhausted = True
-                break
-
-            phase = native.phase
-            phase_counts[phase] = phase_counts.get(phase, 0) + 1
-            action = np.zeros(environment.action_dim, dtype=np.float32)
-            if phase == "control" and finish_at is None:
-                center = native.box_target_center[:2]
-                if control_start is None:
-                    control_start = center.copy()
-                    distance = float(np.linalg.norm(control_start))
-                    direction = -control_start / distance if distance > 1e-12 else np.zeros(2)
-                # Only the remaining scalar distance changes. The direction
-                # and goal stay fixed even if the free box lags its targets.
-                remaining = max(0.0, float((-center) @ direction))
-                action[:2] = direction * min(command_distance, remaining) / 0.001
-                yaw_step = min(yaw_speed_rad_s / environment.fps, native.yaw_action_scale)
-                action[2] = np.clip(-native.box_target_yaw, -yaw_step, yaw_step) / native.yaw_action_scale
-                control_steps += 1
-
-            transition = recorder.step(action)
-            actual_xy = native.pose[0][:2]
-            actual_path_length += float(np.linalg.norm(actual_xy - previous_xy))
-            previous_xy = actual_xy.copy()
-            projection = (np.clip(float((actual_xy - initial_xy) @ box_line) / box_line_squared, 0, 1)
-                          if box_line_squared > 1e-24 else 0.0)
-            closest = initial_xy + projection * box_line
-            max_cross_track = max(max_cross_track, float(np.linalg.norm(actual_xy - closest)))
-            if transition.done or transition.terminated or transition.truncated:
-                break
-
-        info = recorder.last_transition.info
-        result = recorder.save(writer, stop_reason)
-        final_center = native.box_target_center[:2]
-        result.update({
-            "initial_offset_m": initial_xy.tolist(),
-            "initial_yaw_rad": initial_yaw,
-            "initial_yaw_deg": float(np.degrees(initial_yaw)),
-            "yaw_convention": "clockwise_positive_viewed_from_above",
-            "final_xy_error_m": float(info["xy_error"]),
-            "final_yaw_error_rad": float(info["yaw_error"]),
-            "final_yaw_error_deg": float(np.degrees(info["yaw_error"])),
-            "final_height_m": float(info["height"]),
-            "landing_height_error_m": float(info["landing_height_error"]),
-            "max_cross_track_error_m": max_cross_track,
-            "actual_xy_path_length_m": actual_path_length,
-            "final_phase": str(info["phase"]),
-            "finish_reason": info.get("finish_reason"),
-            "failure": bool(info["failure"]),
-            "failure_reason": info.get("failure_reason"),
-            "bounded_tail_exhausted": bounded_tail_exhausted,
-            "phase_frames": phase_counts,
-            "controller": {
-                "name": "fixed_direction_straight_xy_with_center_yaw",
-                "speed_m_s": float(speed_m_s),
-                "yaw_speed_rad_s": float(yaw_speed_rad_s),
-                "yaw_action_scale_rad": native.yaw_action_scale,
-                "goal_yaw_rad": 0.,
-                "final_target_yaw_rad": native.box_target_yaw,
-                "fps": environment.fps,
-                "step_distance_m": command_distance,
-                "action_scale_m": 0.001,
-                "control_start_xy_m": None if control_start is None else control_start.tolist(),
-                "goal_xy_m": goal_xy.tolist(),
-                "direction_xy": None if direction is None else direction.tolist(),
-                "goal_tip_targets_xy_m": goal_grips.tolist(),
-                "final_target_offset_xy_m": final_center.tolist(),
-                "endpoint_reached": bool(np.linalg.norm(final_center) <= 1e-8 and abs(native.box_target_yaw) <= 1e-8),
-                "control_steps": control_steps,
-                "max_steps": max_steps,
-                "tail_limit_steps": tail_limit,
-            },
-        })
-        return result
-    finally:
-        recorder.close()
-
-
 def load_actions(path: Path) -> np.ndarray:
     """Read an N-by-action_dim .npy or the 'action' array from a .npz file."""
     if path.suffix.lower() not in (".npy", ".npz"):
@@ -385,3 +251,114 @@ def load_actions(path: Path) -> np.ndarray:
         raise ValueError("The action source must be a nonempty finite 2-D [frames, action_dim] array.")
     return actions
 
+
+TASKS = {
+    "pusht": "Push the T into its goal",
+    "alignbox3d": "Control both ARX L5 end effectors to align the upper box through physical contact",
+}
+
+
+def main(default_env="pusht", argv=None):
+    """Collect, replay or validate data with ``python -m common.recording``."""
+    import argparse
+    from datetime import datetime, timedelta, timezone
+    import hashlib
+    import json
+
+    from common.teleoperation import DemonstrationSession, run_window
+    from environment import make_environment, SUPPORTED_ENVIRONMENTS
+
+    parser = argparse.ArgumentParser(description="Human collection, action replay and LeRobot dataset validation.")
+    parser.add_argument("--env", choices=SUPPORTED_ENVIRONMENTS, default=default_env)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--task")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--episodes", type=int, help="Human: 0/unset means unlimited.")
+    parser.add_argument("--render-size", type=int, help="Recorded camera width; default 512 for AlignBox3D, 96 for 2-D.")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--actions", type=Path, help="Replay one episode of controller .npy/.npz actions instead of human control.")
+    source.add_argument("--validate", type=Path, metavar="DATASET", help="Check an existing LeRobot dataset without starting a simulator.")
+    args = parser.parse_args(argv)
+    if args.validate:
+        from common.lerobot import validate_dataset
+        print(json.dumps(validate_dataset(args.validate), indent=2))
+        return
+    args.episodes = 0 if args.episodes is None else args.episodes
+    args.render_size = (512 if args.env == "alignbox3d" else 96) if args.render_size is None else args.render_size
+    max_steps = args.max_steps if args.max_steps is not None else (6000 if args.env == "alignbox3d" else 3000)
+    if max_steps < 1 or args.episodes < 0 or not 0 <= args.seed < 2**63:
+        parser.error("max-steps must be positive; episodes nonnegative; seed in [0, 2**63)")
+    if args.render_size < 16 or args.render_size % 2:
+        parser.error("render-size must be an even integer >= 16")
+    if args.actions and args.episodes not in (0, 1):
+        parser.error("--actions supplies exactly one episode")
+    task = args.task if args.task is not None else TASKS[args.env]
+    if not task.strip():
+        parser.error("task must contain a task description")
+    stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S-%f")
+    kind = "replay" if args.actions else "human"
+    output = args.output or Path(__file__).resolve().parents[1] / "training_data/lerobot" / args.env / f"{kind}-{stamp}"
+    actions = load_actions(args.actions) if args.actions else None
+    from common.lerobot import LeRobotWriter, validate_dataset
+    environment = make_environment(args.env, render_size=args.render_size)
+    if hasattr(environment.environment, "render_action"):
+        environment.environment.render_action = False
+    session = None
+    writer = None
+    replay_saved = False
+    try:
+        if actions is not None and actions.shape[1] != environment.action_dim:
+            parser.error(f"{args.env} requires {environment.action_dim} action channels")
+        environment.reset(args.seed)
+        provenance = {
+            "kind": "supplied_controller_actions" if args.actions else "human_teleoperation",
+            "human_demonstration": not args.actions,
+            "environment": args.env, "initial_seed": args.seed,
+            "episode_seed_rule": "initial_seed + saved episode_index; discarded attempts reuse the seed",
+            "modalities": "all available native observations and RGB",
+            "observation_selection": "deferred to the training algorithm",
+            "max_steps": max_steps, "demonstration_quality": "success is recorded, not assumed",
+            "rgb_action_markers": False,
+            "render_size": args.render_size,
+            "environment_contract": environment.contract(),
+            "initialization": environment.lerobot_schema().get("initialization"),
+        }
+        if args.actions:
+            provenance.update(action_source=str(args.actions.resolve()),
+                              action_source_sha256=hashlib.sha256(args.actions.read_bytes()).hexdigest())
+        writer = LeRobotWriter(output, recording_schema(environment), task, provenance=provenance,
+                               max_frames_per_file=1)
+        print(f"Dataset: {output.resolve()}", flush=True)
+        if actions is not None:
+            environment.reset(args.seed)
+            result = record_episode(environment, actions, writer, max_steps=max_steps)
+            replay_saved = True
+            print(json.dumps(result), flush=True)
+        else:
+            session = DemonstrationSession(environment, writer, args.seed, max_steps)
+            print(("Space starts/pauses; 1/2/3 select inner/outer/both tools; arrows: XY; PgUp/Dn: Z; Q/E: yaw; I/K: rx; J/L: ry; O/P: open/close grippers; Enter saves; Esc saves and quits."
+                   if args.env == "alignbox3d" else
+                   "Space starts/pauses; Enter saves; R discards; Esc saves partial and quits."), flush=True)
+            try:
+                run_window(session, args.episodes)
+            except KeyboardInterrupt:
+                if writer.aborted:
+                    raise
+                session.finish_and_save("keyboard_interrupt")
+    finally:
+        try:
+            if session is not None:
+                session.close()
+            if writer is not None and (replay_saved or (session is not None and session.saved)):
+                writer.close()
+        finally:
+            environment.close()
+    if replay_saved or (session is not None and session.saved):
+        print(json.dumps(validate_dataset(output), indent=2))
+    else:
+        print("No demonstrations saved; no dataset was finalized.")
+
+
+if __name__ == "__main__":
+    main()

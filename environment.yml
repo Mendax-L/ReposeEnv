@@ -1,4 +1,4 @@
-name: pushenv
+name: ReposeEnv
 channels:
   - conda-forge
 dependencies:

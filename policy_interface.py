@@ -23,7 +23,7 @@ class PolicyInterface:
 
     obs='state' returns the canonical state vector; 'keypoint' concatenates
     object keypoints and agent positions; 'image' returns every RGB camera stream
-    plus agent positions (both cameras for PushBox3D); 'all' returns every
+    plus agent positions (both cameras for AlignBox3D); 'all' returns every
     recording observation.
     """
 
@@ -111,12 +111,12 @@ def receive_message(connection: socket.socket) -> dict[str, Any]:
 
 
 
-def assert_environment_runtime(expected_env: str = "pushenv") -> None:
+def assert_environment_runtime(expected_env: str = "ReposeEnv") -> None:
     actual = Path(sys.prefix).name.lower()
     if actual != expected_env.lower():
-        raise RuntimeError(f"Push runtime requires Conda env '{expected_env}', got '{actual}'.")
+        raise RuntimeError(f"ReposeEnv runtime requires Conda env '{expected_env}', got '{actual}'.")
     if importlib.util.find_spec("torch") is not None:
-        raise RuntimeError("Isolation violation: PyTorch belongs in the model runtime, not pushenv.")
+        raise RuntimeError("Isolation violation: PyTorch belongs in the model runtime, not ReposeEnv.")
 
 
 def connect_with_retry(host: str, port: int, timeout: float) -> socket.socket:
@@ -141,17 +141,15 @@ def _rgb_history(images: np.ndarray) -> dict[str, Any]:
     return {"shape": list(images.shape), "data": base64.b64encode(images.tobytes()).decode("ascii")}
 
 
-def _landing_transitions(environment: PushEnvironment, reason: str):
-    """Finish a 3-D episode with at most 60 extra seconds of simulation."""
+def _finish_transitions(environment: PushEnvironment, reason: str):
+    """End a 3-D episode at its current pose without advancing physics."""
     if environment.environment.phase in ("complete", "failed"):
         return
     environment.request_finish(reason)
-    for _ in range(60 * environment.fps):
-        transition = environment.step(np.zeros(environment.action_dim, dtype=np.float32))
-        yield transition
-        if transition.done or transition.terminated or transition.truncated:
-            return
-    raise RuntimeError("Physical landing did not finish within 60 seconds of simulation.")
+    transition = environment.step(environment.hold_action())
+    yield transition
+    if not transition.done:
+        raise RuntimeError("Requested episode completion did not end the episode.")
 
 
 def run_rollout(
@@ -162,10 +160,9 @@ def run_rollout(
     max_steps: int,
     health: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run complete episodes; max_steps counts opening and XY control ticks.
+    """Run complete episodes; max_steps counts direct end-effector control ticks.
 
-    Three-dimensional episodes may exceed that budget only to finish the
-    physical lift/landing sequence, with a bounded 60-second extra tail.
+    Requested completion inserts no robot motion.
     """
     image_shape = health.get("image_shape")
     image_key = health.get("image_key", "observation.images.front")
@@ -179,7 +176,7 @@ def run_rollout(
     lengths: list[int] = []
     successes: list[bool] = []
     results: list[dict[str, Any]] = []
-    spatial = environment.name == "pushbox3d"
+    spatial = environment.name == "alignbox3d"
     episode_in_progress = False
     try:
         n_obs_steps, n_action_steps = validate_policy_contract(environment, health)
@@ -228,11 +225,11 @@ def run_rollout(
             while not done:
                 if steps >= max_steps:
                     if spatial:
-                        for transition in _landing_transitions(environment, "max_steps"):
+                        for transition in _finish_transitions(environment, "max_steps"):
                             consume(transition, update_inputs=False)
                     break
                 if spatial and environment.environment.phase != "control":
-                    actions = np.zeros((1, environment.action_dim), dtype=np.float32)
+                    actions = environment.hold_action()[None, :]
                 else:
                     observation = np.stack(history).tolist()
                     if image_shape is not None:
@@ -248,8 +245,7 @@ def run_rollout(
                         raise RuntimeError("Policy actions exceed the environment bounds.")
                 for action in actions:
                     consume(environment.step(action))
-                    # Discard any remaining model chunk as soon as automatic
-                    # landing starts; model commands only operate during XY.
+                    # Stop consuming a model chunk once the episode completes.
                     if done or steps >= max_steps or (spatial and environment.environment.phase != "control"):
                         break
             episode_in_progress = False
@@ -262,11 +258,11 @@ def run_rollout(
     except BaseException:
         if spatial and episode_in_progress:
             try:
-                for _ in _landing_transitions(environment, "policy_error"):
+                for _ in _finish_transitions(environment, "policy_error"):
                     pass
             except BaseException:
                 pass
-        # Landing or cleanup errors must not replace the original model,
+        # Completion or cleanup errors must not replace the original model,
         # connection, rendering or user-interrupt exception.
         try:
             environment.close()
@@ -340,7 +336,7 @@ def main():
         return
     if args.obs in ("keypoint", "all"):
         parser.error("Use PolicyInterface in Python for keypoint/all; TCP negotiates state or image from the model")
-    assert_environment_runtime("pushenv")
+    assert_environment_runtime()
     with connect_with_retry(args.host, args.port, args.connect_timeout) as connection:
         connection.settimeout(args.socket_timeout)
         send_message(connection, {"op": "health", "protocol": PROTOCOL_VERSION})

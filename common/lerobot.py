@@ -3,15 +3,16 @@
 The public schema follows LeRobot v3.0.  Low-dimensional samples are written to
 Parquet, RGB observations to MP4, and episode boundaries to relational metadata.
 The implementation intentionally avoids torch and the full lerobot package so it
-can run in the isolated ``pushenv`` environment.
+can run in the isolated ``ReposeEnv`` environment.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import imageio.v2 as imageio
 import numpy as np
@@ -59,6 +60,8 @@ class LeRobotWriter:
             raise ValueError("max_frames_per_file must be positive.")
         self.schema = copy.deepcopy(schema)
         self.task = task.strip()
+        self._tasks: list[str] = []
+        self._task_to_index: dict[str, int] = {}
         self.provenance = copy.deepcopy(provenance or {})
         self.fps = int(self.schema["fps"])
         if self.fps <= 0 or self.fps != self.schema["fps"]:
@@ -90,6 +93,7 @@ class LeRobotWriter:
         self.root.mkdir(parents=True, exist_ok=True)
         self._episodes: list[dict[str, Any]] = []
         self._pending: list[dict[str, np.ndarray]] = []
+        self._pending_tasks: list[list[str]] = []
         self._pending_frames = 0
         self._total_frames = 0
         self._file_index = 0
@@ -133,17 +137,128 @@ class LeRobotWriter:
             raise ValueError("Every episode feature must have the same positive frame count.")
         return result
 
-    def write_episode(self, data: dict[str, np.ndarray]) -> None:
+    def write_episode(self, data: dict[str, np.ndarray], task: str | Sequence[str] | None = None) -> None:
         if self._closed:
             raise RuntimeError("Cannot write after close().")
         episode = self._validate_episode(data)
         length = len(next(iter(episode.values())))
+        task = self.task if task is None else task
+        tasks = [task] * length if isinstance(task, str) else list(task)
+        if len(tasks) != length or any(not isinstance(value, str) or not value.strip() for value in tasks):
+            raise ValueError("Tasks must contain one nonempty instruction per frame.")
+        tasks = [value.strip() for value in tasks]
+        for value in dict.fromkeys(tasks):
+            if value not in self._task_to_index:
+                self._task_to_index[value] = len(self._tasks)
+                self._tasks.append(value)
         if self._pending and self._pending_frames + length > self.max_frames_per_file:
             self._flush_file()
         self._pending.append(episode)
+        self._pending_tasks.append(tasks)
         self._pending_frames += length
         if self._pending_frames >= self.max_frames_per_file:
             self._flush_file()
+
+    def import_episode(self, source: str | Path, *, require_success: bool = True) -> None:
+        """Import one completed worker episode without decoding/re-encoding RGB.
+
+        Only the coordinator calls this. Workers own separate temporary datasets.
+        Numeric indices and metadata are rebuilt for the destination dataset.
+        """
+        if self._closed:
+            raise RuntimeError("Cannot import after close().")
+        source = Path(source)
+        source_schema = json.loads((source/"meta/pushenv_schema.json").read_text(encoding="utf-8"))
+        if source_schema["features"] != self.schema["features"] or source_schema["fps"] != self.fps:
+            raise ValueError("Worker feature schema or FPS differs from the destination.")
+        for key in ("observation_layout", "action_semantics"):
+            if source_schema.get(key) != self.schema.get(key):
+                raise ValueError(f"Worker contract differs at {key}.")
+        records = [row for path in sorted((source/"meta/episodes").rglob("*.parquet"))
+                   for row in pq.read_table(path).to_pylist()]
+        if len(records) != 1:
+            raise ValueError("Import requires exactly one completed worker episode.")
+        record = copy.deepcopy(records[0])
+        data_path = source/DATA_PATH.format(chunk_index=record["data/chunk_index"], file_index=record["data/file_index"])
+        table = pq.read_table(data_path)
+        length = len(table)
+        if length != record["length"] or record["dataset_from_index"] != 0:
+            raise ValueError("Worker episode data boundaries are invalid.")
+        if require_success and ("next.success" not in table.column_names
+                or table["next.success"][-1].as_py() is not True
+                or table["next.truncated"][-1].as_py() is not False):
+            raise ValueError("Only completed successful worker episodes can be imported.")
+        self._flush_file()
+        source_tasks = pd.read_parquet(source/"meta/tasks.parquet")
+        source_task_names = dict(zip(source_tasks["task_index"], source_tasks.index))
+        try:
+            frame_tasks = [source_task_names[index] for index in table["task_index"].to_pylist()]
+        except KeyError as error:
+            raise ValueError("Worker task index is absent from tasks.parquet.") from error
+        if set(frame_tasks) != set(record["tasks"]):
+            raise ValueError("Worker episode task names disagree with frame labels.")
+        for task in dict.fromkeys(frame_tasks):
+            if task not in self._task_to_index:
+                self._task_to_index[task] = len(self._tasks)
+                self._tasks.append(task)
+        generated = {
+            "episode_index": np.full(length, len(self._episodes), dtype=np.int64),
+            "index": np.arange(self._total_frames, self._total_frames+length, dtype=np.int64),
+            "task_index": np.asarray([self._task_to_index[task] for task in frame_tasks], dtype=np.int64),
+        }
+        for key, values in generated.items():
+            table = table.set_column(table.column_names.index(key), key, pa.array(values))
+        record.update(episode_index=len(self._episodes), dataset_from_index=self._total_frames,
+            dataset_to_index=self._total_frames+length, **{"data/chunk_index": 0,
+            "data/file_index": self._file_index, "meta/episodes/chunk_index": 0,
+            "meta/episodes/file_index": 0})
+        destination = self.root/DATA_PATH.format(chunk_index=0, file_index=self._file_index)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            pq.write_table(table, destination, compression="zstd")
+            for key in self.data_keys:
+                values = np.asarray(table[key].to_pylist(), dtype=_dtype(self.features[key]["dtype"]))
+                values = values.reshape((length, *self.features[key]["shape"]))
+                moments = self._moments(key, values)
+                self._update_stats(key, values, moments)
+                for statistic, value in self._episode_stats(key, values, moments).items():
+                    record[f"stats/{key}/{statistic}"] = value
+            for key in self.video_keys:
+                source_video = source/VIDEO_PATH.format(video_key=key,
+                    chunk_index=record[f"videos/{key}/chunk_index"], file_index=record[f"videos/{key}/file_index"])
+                destination_video = self.root/VIDEO_PATH.format(video_key=key, chunk_index=0, file_index=self._file_index)
+                destination_video.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_video, destination_video)
+                record[f"videos/{key}/chunk_index"] = 0
+                record[f"videos/{key}/file_index"] = self._file_index
+                record[f"videos/{key}/from_timestamp"] = 0.
+                record[f"videos/{key}/to_timestamp"] = length/self.fps
+                shape = np.asarray(record[f"stats/{key}/mean"]).shape
+                pixels = length*int(np.prod(self.features[key]["shape"][:2]))
+                mean = np.asarray(record[f"stats/{key}/mean"]).ravel()
+                std = np.asarray(record[f"stats/{key}/std"]).ravel()
+                minimum = np.asarray(record[f"stats/{key}/min"]).ravel()
+                maximum = np.asarray(record[f"stats/{key}/max"]).ravel()
+                current = self._stats.get(key)
+                if current is None:
+                    self._stats[key] = {"count": length, "moment_count": pixels,
+                        "output_shape": shape, "sum": mean*pixels,
+                        "sum_sq": (std**2+mean**2)*pixels, "min": minimum, "max": maximum,
+                        "is_bool": False}
+                else:
+                    current["count"] += length
+                    current["moment_count"] += pixels
+                    current["sum"] += mean*pixels
+                    current["sum_sq"] += (std**2+mean**2)*pixels
+                    current["min"] = np.minimum(current["min"], minimum)
+                    current["max"] = np.maximum(current["max"], maximum)
+            self._episodes.append(record)
+            self._total_frames += length
+            self._file_index += 1
+            self.checkpoint()
+        except BaseException:
+            self.abort()
+            raise
 
     def _moments(self, key: str, value: np.ndarray):
         """Reduce RGB exactly by pixel counts, with bounded scratch memory."""
@@ -212,9 +327,10 @@ class LeRobotWriter:
         start_global = self._total_frames
         rows: dict[str, list[np.ndarray]] = {key: [] for key in self.data_keys}
         local_offset = 0
-        for local_episode, episode in enumerate(self._pending):
+        for local_episode, (episode, episode_task) in enumerate(zip(self._pending, self._pending_tasks)):
             length = len(next(iter(episode.values())))
             episode_index = len(self._episodes)
+            task_indices = np.asarray([self._task_to_index[task] for task in episode_task], dtype=np.int64)
             # Episode and dataset statistics use the same reductions. Cache
             # only channel/feature summaries, never another RGB frame batch.
             episode_moments = {}
@@ -223,7 +339,7 @@ class LeRobotWriter:
                 "frame_index": np.arange(length, dtype=np.int64),
                 "episode_index": np.full(length, episode_index, dtype=np.int64),
                 "index": np.arange(self._total_frames, self._total_frames + length, dtype=np.int64),
-                "task_index": np.zeros(length, dtype=np.int64),
+                "task_index": task_indices,
             }
             for key in self.data_keys:
                 value = generated[key] if key in generated else episode[key]
@@ -233,7 +349,7 @@ class LeRobotWriter:
                 self._update_stats(key, value, moments)
             record: dict[str, Any] = {
                 "episode_index": episode_index,
-                "tasks": [self.task],
+                "tasks": list(dict.fromkeys(episode_task)),
                 "length": length,
                 "dataset_from_index": self._total_frames,
                 "dataset_to_index": self._total_frames + length,
@@ -279,6 +395,7 @@ class LeRobotWriter:
             finally:
                 writer.close()
         self._pending.clear()
+        self._pending_tasks.clear()
         self._pending_frames = 0
         self._file_index += 1
         if self._total_frames <= start_global:
@@ -294,7 +411,8 @@ class LeRobotWriter:
         episode_path = self.root / EPISODE_PATH.format(chunk_index=0, file_index=0)
         episode_path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.Table.from_pylist(self._episodes), episode_path, compression="zstd")
-        task_frame = pd.DataFrame({"task_index": [0]}, index=pd.Index([self.task]))
+        task_frame = pd.DataFrame({"task_index": np.arange(len(self._tasks), dtype=np.int64)},
+                                  index=pd.Index(self._tasks))
         task_frame.to_parquet(self.root / "meta/tasks.parquet")
 
         stats: dict[str, Any] = {}
@@ -314,7 +432,7 @@ class LeRobotWriter:
             "robot_type": self.schema.get("robot_type", self.schema.get("environment", "unknown")),
             "total_episodes": len(self._episodes),
             "total_frames": self._total_frames,
-            "total_tasks": 1,
+            "total_tasks": len(self._tasks),
             "chunks_size": 1000,
             "data_files_size_in_mb": 100,
             "video_files_size_in_mb": 500,
@@ -344,6 +462,7 @@ class LeRobotWriter:
             return
         self.aborted = self._closed = True
         self._pending.clear()
+        self._pending_tasks.clear()
         self._pending_frames = 0
         for index in range(self._checkpoint_file_index, self._file_index + 1):
             paths = [self.root / DATA_PATH.format(chunk_index=0, file_index=index)]
@@ -380,6 +499,9 @@ def validate_dataset(root: str | Path) -> dict[str, Any]:
     video_keys = [key for key, feature in info["features"].items() if feature["dtype"] == "video"]
     rows = 0
     last_index = -1
+    frame_task_indices = []
+    frame_stage_ids, frame_stage_vectors = [], []
+    has_stage_language = "language.stage_id" in info["features"] and "language.stage" in info["features"]
     for path in data_files:
         table = pq.read_table(path)
         missing = required - set(table.column_names)
@@ -390,6 +512,10 @@ def validate_dataset(root: str | Path) -> dict[str, Any]:
             raise ValueError("Global indices are not contiguous.")
         if len(indices):
             last_index = int(indices[-1])
+        frame_task_indices.append(table["task_index"].to_numpy())
+        if has_stage_language:
+            frame_stage_ids.append(table["language.stage_id"].to_numpy())
+            frame_stage_vectors.append(np.asarray(table["language.stage"].to_pylist()))
         rows += len(table)
     episodes = pa.concat_tables([pq.read_table(path) for path in episode_files]).to_pylist()
     if rows != info["total_frames"] or len(episodes) != info["total_episodes"]:
@@ -425,6 +551,35 @@ def validate_dataset(root: str | Path) -> dict[str, Any]:
     task_frame = pd.read_parquet(root / "meta/tasks.parquet")
     if list(task_frame.columns) != ["task_index"] or len(task_frame) != info["total_tasks"]:
         raise ValueError("tasks.parquet has an invalid schema.")
+    if (not task_frame.index.is_unique
+            or task_frame.index.tolist() != [str(task) for task in task_frame.index]
+            or task_frame["task_index"].tolist() != list(range(len(task_frame)))):
+        raise ValueError("tasks.parquet must map unique task strings to contiguous indices.")
+    frame_task_indices = np.concatenate(frame_task_indices)
+    if np.any((frame_task_indices < 0) | (frame_task_indices >= len(task_frame))):
+        raise ValueError("Frame task_index lies outside tasks.parquet.")
+    if has_stage_language:
+        labels = np.asarray(info["features"]["language.stage"]["names"])
+        stage_ids = np.concatenate(frame_stage_ids)
+        vectors = np.concatenate(frame_stage_vectors)
+        if np.any((stage_ids < -1) | (stage_ids >= len(labels))):
+            raise ValueError("Language stage IDs lie outside the stage vocabulary.")
+        labelled = stage_ids >= 0
+        expected_vectors = np.zeros((rows, len(labels)))
+        expected_vectors[labelled] = np.eye(len(labels))[stage_ids[labelled]]
+        if not np.array_equal(vectors, expected_vectors):
+            raise ValueError("Language stage IDs and one-hot vectors disagree.")
+        tasks = task_frame.index.to_numpy()[frame_task_indices[labelled]]
+        if not np.array_equal(tasks, labels[stage_ids[labelled]]):
+            raise ValueError("Frame task text disagrees with its language stage label.")
+    for episode in episodes:
+        names = episode.get("tasks")
+        if not isinstance(names, list) or not names or any(name not in task_frame.index for name in names):
+            raise ValueError("Episode task names are absent from tasks.parquet.")
+        start, end = episode["dataset_from_index"], episode["dataset_to_index"]
+        expected = {int(task_frame.loc[name, "task_index"]) for name in names}
+        if set(frame_task_indices[start:end].tolist()) != expected:
+            raise ValueError("Episode task names disagree with frame task_index values.")
     return {"root": str(root.resolve()), "frames": rows, "episodes": len(episodes),
             "tasks": len(task_frame), "data_files": len(data_files),
             "video_files": len(list((root / "videos").rglob("*.mp4")))}

@@ -1,4 +1,4 @@
-"""PushBox3D human control and Python collection entry point."""
+"""AlignBox3D human control and Python collection entry point."""
 from common.controllers import SpatialTeleop
 
 
@@ -7,8 +7,8 @@ def create_teleop(environment):
 
 
 def main():
-    from record import main as record_main
-    record_main(default_env="pushbox3d")
+    from common.recording import main as record_main
+    record_main(default_env="alignbox3d")
 
 
 if __name__ == "__main__":

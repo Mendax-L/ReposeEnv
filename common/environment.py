@@ -85,7 +85,7 @@ class PushEnvironment:
     @property
     def fps(self) -> int:
         """Control/sampling frequency, independent of physics substeps."""
-        frequency = (1.0 / self.environment.dt if self.name == "pushbox3d"
+        frequency = (1.0 / self.environment.dt if self.name == "alignbox3d"
                      else self.environment.control_hz)
         if not np.isclose(frequency, round(frequency)) or frequency <= 0:
             raise ValueError(f"LeRobot requires a positive integer sampling frequency, got {frequency}.")
@@ -128,9 +128,9 @@ class PushEnvironment:
     def recording_schema(self) -> dict[str, Any]:
         """All available recording modalities, independent of policy inputs."""
         schema = self.lerobot_schema()
-        if self.name == "pushbox3d":
+        if self.name == "alignbox3d":
             return schema
-        agents = ["agent"] if self.name == "pusht" else ["external_agent", "internal_agent"]
+        agents = ["agent"]
         agent_names = [f"{agent}.{axis}" for agent in agents for axis in "xy"]
         keypoint_names = schema["features"]["observation.state"]["names"][:-len(agent_names)]
         fields = {
@@ -155,10 +155,10 @@ class PushEnvironment:
     def recording_observation(self, *, include_images: bool = True) -> dict[str, np.ndarray]:
         """Snapshot RGB, keypoints, pose, velocities and contacts together."""
         observation = self.lerobot_observation(include_images=include_images)
-        if self.name == "pushbox3d":
+        if self.name == "alignbox3d":
             return observation
         native = self.environment
-        agents = [native.agent] if self.name == "pusht" else [native.agent, native.internal_agent]
+        agents = [native.agent]
         positions = np.concatenate([np.asarray(agent.position) for agent in agents])
         observation.update({
             "observation.keypoints": self._latest_observation[:-len(positions)].copy(),
@@ -182,10 +182,9 @@ class PushEnvironment:
     def get_agent_positions(self) -> np.ndarray:
         if self._latest_observation is None:
             raise RuntimeError("Call reset(seed) before reading agent positions.")
-        if self.name == "pushbox3d":
+        if self.name == "alignbox3d":
             return self._latest_observation[37:43].copy()
-        position_dim = 4 if self.name == "pushbox2d" else 2
-        return self._latest_observation[-position_dim:].copy()
+        return self._latest_observation[-2:].copy()
 
     def teleop_agent(self):
         """Return a controller with act(obs, mouse=..., direction=...)."""

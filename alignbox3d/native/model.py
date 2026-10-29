@@ -1,8 +1,9 @@
-"""Two real-size ARX L5 arms holding an upper open box in MuJoCo.
+"""Two real-size ARX L5 arms with independent end-effector control in MuJoCo.
 
 All distances are metres and all joint angles are radians.  Each box consists
 of exactly five rigid box geoms: one floor and four walls.  The upper box is a
-free body attached to both tips by weld constraints; the lower box is fixed.
+free body moved by physical contact; the lower box is fixed. Reset starts
+with open grippers clear of the box.
 The vendored Google DeepMind MuJoCo
 Menagerie ARX L5 description supplies the original kinematic tree, inertia,
 joint limits, actuator torque limits, visual meshes, and collision geometry.
@@ -67,12 +68,6 @@ JOINT_LIMITS = (
     (-3.14, 3.14), (0., 3.14), (0., 3.14),
     (-1.7, 1.7), (-1.7, 1.7), (-3.14, 3.14),
 )
-
-
-def yaw_rotation(yaw: float):
-    """Clockwise-positive central yaw, viewed from above; radians."""
-    c, s = math.cos(yaw), math.sin(yaw)
-    return ((c, s, 0.), (-s, c, 0.), (0., 0., 1.))
 
 
 def _fmt(values: Sequence[float]) -> str:
@@ -152,6 +147,11 @@ def _arm_sections(name: str) -> dict[str, str]:
             # source actuator's original 100 N m torque saturation.
             actuator.set("kp", "80")
             actuator.set("kv", "5")
+        else:
+            # Metre-scale finger slides need enough position-loop stiffness
+            # to hold the 650 g payload; retain the original +/-10 N limit.
+            actuator.set("kp", "2500")
+            actuator.set("kv", "40")
     collision_defaults = arm.find(f"./default/default/default[@class='{name}_collision']/geom")
     assert collision_defaults is not None
     collision_defaults.set("contype", "4")
@@ -215,8 +215,8 @@ def build_scene(offset: Sequence[float] = (0.035, -0.02), yaw: float = 0.0) -> s
   <size nconmax="300" njmax="1500"/>
   <visual>
     <global offwidth="1280" offheight="960" azimuth="90" elevation="-75"/>
-    <quality shadowsize="2048" offsamples="4"/>
-    <headlight ambient=".25 .25 .25" diffuse=".35 .35 .35" specular=".1 .1 .1"/>
+    <quality shadowsize="4096" offsamples="4"/>
+    <headlight ambient=".18 .18 .18" diffuse=".25 .25 .25" specular=".06 .06 .06"/>
     <map znear=".01" zfar="20"/>
   </visual>
   <statistic center="0 0 .20" extent="1.3"/>
@@ -232,12 +232,14 @@ def build_scene(offset: Sequence[float] = (0.035, -0.02), yaw: float = 0.0) -> s
   </default>
   <asset>
     {arm_assets}
+    <texture name="skybox" type="skybox" builtin="gradient" rgb1=".48 .50 .52"
+             rgb2=".30 .32 .34" width="512" height="3072"/>
     <texture name="floor_checker" type="2d" builtin="checker" rgb1=".19 .22 .28"
              rgb2=".23 .26 .32" width="512" height="512"/>
     <material name="floor_material" texture="floor_checker" texrepeat="4 4" reflectance=".04"/>
     <material name="table_material" rgba=".70 .74 .79 1" specular=".25" shininess=".25"/>
-    <material name="lower_box_material" rgba=".18 .42 .62 1" specular=".3" shininess=".4"/>
-    <material name="upper_box_material" rgba=".95 .55 .17 1" specular=".3" shininess=".4"/>
+    <material name="lower_box_material" rgba=".18 .42 .62 1" specular=".16" shininess=".22"/>
+    <material name="upper_box_material" rgba=".95 .55 .17 1" specular=".16" shininess=".22"/>
     <material name="inner_paint" rgba=".10 .65 .67 1" specular=".5" shininess=".5"/>
     <material name="outer_paint" rgba=".38 .45 .83 1" specular=".5" shininess=".5"/>
     <material name="dark_metal" rgba=".13 .16 .21 1" specular=".5" shininess=".5"/>
@@ -246,8 +248,9 @@ def build_scene(offset: Sequence[float] = (0.035, -0.02), yaw: float = 0.0) -> s
     <material name="tip_rubber" rgba=".14 .17 .20 1" specular=".1" shininess=".1"/>
   </asset>
   <worldbody>
-    <light name="key" pos="-1.3 -1.1 2.6" dir=".4 .3 -1" diffuse=".5 .5 .5" castshadow="false"/>
-    <light name="fill" pos="1.5 .5 1.8" dir="-.6 -.2 -1" diffuse=".25 .27 .3" castshadow="false"/>
+    <light name="key" pos="-1.3 -1.1 2.6" dir=".4 .3 -1" diffuse=".58 .57 .55"
+           directional="true" castshadow="true"/>
+    <light name="fill" pos="1.5 .5 1.8" dir="-.6 -.2 -1" diffuse=".27 .28 .30" castshadow="false"/>
     <camera name="overview" pos="0 -.15 2.4" xyaxes="1 0 0 0 1 0" fovy="26"/>
     <camera name="top" pos="0 0 1.7" xyaxes="1 0 0 0 1 0" fovy="48"/>
     <!-- Look down about 17 degrees: keep the two front walls and alignment edges
@@ -282,8 +285,6 @@ def build_scene(offset: Sequence[float] = (0.035, -0.02), yaw: float = 0.0) -> s
   </contact>
   <equality>
     {arm_equalities}
-    <weld name="inner_attach" site1="inner_tip" site2="inner_grip" solref=".008 1" solimp=".99 .999 .001"/>
-    <weld name="outer_attach" site1="outer_tip" site2="outer_grip" solref=".008 1" solimp=".99 .999 .001"/>
   </equality>
 </mujoco>
 """
