@@ -6,6 +6,7 @@ import importlib.util
 import sys
 import numpy as np
 from .schema import CAMERA_KEY, get_environment_schema
+from .config import load_environment_config
 OBS_DIM = 20
 ACTION_DIM = 2
 WORKSPACE_SIZE = 512.0
@@ -31,6 +32,7 @@ class PushEnvironment:
     """One external action/observation contract over a native push environment."""
 
     name: str
+    task_description = "请完成当前环境的任务。"
     obs_dim = OBS_DIM
     action_dim = ACTION_DIM
     action_low = (0.0, 0.0)
@@ -41,6 +43,16 @@ class PushEnvironment:
     def __init__(self, environment: Any) -> None:
         self.environment = environment
         self._latest_observation: np.ndarray | None = None
+        self._interface_config = load_environment_config(self.name)
+        schema = get_environment_schema(self.name)
+        self.obs_dim = schema["features"]["observation.state"]["shape"][0]
+        self.action_dim = schema["features"]["action"]["shape"][0]
+        self.action_low = tuple(schema["feature_semantics"]["action"]["low"])
+        self.action_high = tuple(schema["feature_semantics"]["action"]["high"])
+        self.observation_layout = schema["observation_layout"]
+        self.action_semantics = schema["action_semantics"]
+        self.instruction = self.task_description
+        self.action_groups = schema["action_groups"]
 
     def reset(self, seed: int) -> np.ndarray:
         if hasattr(self.environment, "seed"):
@@ -107,7 +119,7 @@ class PushEnvironment:
         if self._latest_observation is None:
             raise RuntimeError("Call reset(seed) before reading a LeRobot observation.")
         observation = {"observation.state": self._latest_observation.copy()}
-        if include_images:
+        if include_images and CAMERA_KEY in self.lerobot_schema()["features"]:
             image = self.render()
             expected_shape = tuple(self.lerobot_schema()["features"][CAMERA_KEY]["shape"])
             if image.shape != expected_shape or image.dtype != np.uint8:
@@ -116,6 +128,7 @@ class PushEnvironment:
         return observation
 
     def contract(self) -> dict[str, Any]:
+        schema = self.lerobot_schema()
         return {
             "obs_dim": self.obs_dim,
             "action_dim": self.action_dim,
@@ -123,6 +136,13 @@ class PushEnvironment:
             "action_high": list(self.action_high),
             "observation_layout": self.observation_layout,
             "action_semantics": self.action_semantics,
+            "observation_names": schema["features"]["observation.state"]["names"],
+            "action_names": schema["features"]["action"]["names"],
+            "fps": self.fps,
+            "interface": self._interface_config,
+            "interface_features": schema["interface_features"],
+            "interface_semantics": schema["interface_semantics"],
+            "action_groups": self.action_groups,
         }
 
     def recording_schema(self) -> dict[str, Any]:
@@ -132,7 +152,7 @@ class PushEnvironment:
             return schema
         agents = ["agent"]
         agent_names = [f"{agent}.{axis}" for agent in agents for axis in "xy"]
-        keypoint_names = schema["features"]["observation.state"]["names"][:-len(agent_names)]
+        keypoint_names = [f"object.keypoint_{i}.{axis}" for i in range(9) for axis in "xy"]
         fields = {
             "observation.keypoints": (keypoint_names, ["workspace_pixel"] * len(keypoint_names)),
             "observation.agent_pos": (agent_names, ["workspace_pixel"] * len(agent_names)),
@@ -161,7 +181,7 @@ class PushEnvironment:
         agents = [native.agent]
         positions = np.concatenate([np.asarray(agent.position) for agent in agents])
         observation.update({
-            "observation.keypoints": self._latest_observation[:-len(positions)].copy(),
+            "observation.keypoints": self.get_keypoints().reshape(-1),
             "observation.agent_pos": positions.astype(np.float32),
             "observation.environment_state": np.asarray([*positions, *native.block.position, native.block.angle % (2 * np.pi)], dtype=np.float32),
             "observation.velocity": np.asarray([*(value for agent in agents for value in agent.velocity),
@@ -175,6 +195,18 @@ class PushEnvironment:
         """Read every native modality at the current time without stepping."""
         return self.recording_observation(include_images=include_images)
 
+    def interface_observation(self, *, include_images: bool = True) -> dict[str, Any]:
+        """Select exactly the final observation fields declared by the YAML."""
+        metadata = self.observe(include_images=include_images)
+        metadata["robot.agent_pos"] = self.get_agent_positions()
+        metadata["instruction"] = self.instruction
+        metadata.update({key.removeprefix("observation."): value for key, value in list(metadata.items())
+                         if key.startswith("observation.images.")})
+        declared = [field for fields in self._interface_config["observation"].values()
+                    for field in fields]
+        return {field: metadata[field] for field in declared
+                if include_images or not field.startswith("images.")}
+
     def get_keypoints(self) -> np.ndarray:
         """Object keypoint coordinates; implemented by each task."""
         raise NotImplementedError
@@ -183,7 +215,7 @@ class PushEnvironment:
         if self._latest_observation is None:
             raise RuntimeError("Call reset(seed) before reading agent positions.")
         if self.name == "alignbox3d":
-            return self._latest_observation[37:43].copy()
+            return self.environment.tip_positions.reshape(-1).astype(np.float32)
         return self._latest_observation[-2:].copy()
 
     def teleop_agent(self):

@@ -12,7 +12,7 @@ import numpy as np
 from common.lerobot import LeRobotWriter
 from .diversity import DiverseAlignBox3DEnv, is_heldout_configuration
 from .grasp_collection import GraspConfig, collect_grasp_episode
-from .stage_labels import STAGE_LABELS
+from .stage_labels import STAGE_INSTRUCTIONS
 
 
 _worker_environment = None
@@ -46,7 +46,7 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
 def worker_attempt(seed, attempt, settings, config_values, schema, scratch):
     environment = _worker_environment
     root = Path(scratch)/f"attempt-{attempt:08d}"
-    writer = LeRobotWriter(root, schema, STAGE_LABELS[0],
+    writer = LeRobotWriter(root, schema, STAGE_INSTRUCTIONS[0][0],
         provenance={"kind": "isolated_grasp_worker", "seed": seed, "pid": os.getpid()},
         max_frames_per_file=1)
     try:

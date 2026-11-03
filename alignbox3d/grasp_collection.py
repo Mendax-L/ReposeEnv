@@ -6,7 +6,7 @@ import numpy as np
 from common.recording import EpisodeRecorder
 from .geometry import quaternion, rotation_vector, smoothstep
 from .native.model import BOX_SIZE, GRIP_POINTS
-from .stage_labels import EXPERT_STAGES, EXPERT_STAGE_LABEL_IDS, STAGE_LABELS
+from .stage_labels import EXPERT_STAGES, EXPERT_STAGE_LABEL_IDS, STAGE_LABELS, sample_stage_instructions
 FREE_TOOL_STAGES = frozenset(("approach_above", "approach_rim", "orient_grasp",
                               "withdraw_orient", "withdraw_above", "park"))
 
@@ -83,6 +83,7 @@ class GraspCarryExpert:
         self.native = environment.environment
         self.config = config or GraspConfig()
         self.seed = int(seed)
+        self.stage_instructions = sample_stage_instructions(self.seed)
         self.step_callback = environment.step if step is None else step
         self.max_steps = max_steps
         self.frames = 0
@@ -112,11 +113,13 @@ class GraspCarryExpert:
         self.stage_start_z = float(self.native.pose[0][2])
         label_id = EXPERT_STAGE_LABEL_IDS[EXPERT_STAGES.index(name)]
         self.environment.language_stage_id = label_id
+        self.environment.instruction = self.stage_instructions[label_id]
         if hasattr(self.environment, "collection_metadata"):
             self.environment.collection_metadata["expert_stage_id"] = EXPERT_STAGES.index(name)
         centre, rotation = self.box_pose()
         self.trace.append({"stage": name, "language_stage_id": label_id,
                            "language_label": STAGE_LABELS[label_id], "frame": self.frames,
+                           "instruction": self.stage_instructions[label_id],
                            "box_center_world_m": centre.tolist(),
                            "box_quaternion_wxyz": quaternion(rotation).tolist()})
 
@@ -167,7 +170,10 @@ class GraspCarryExpert:
         next_target = n.gripper_targets + np.clip(target-n.gripper_targets,
                                                   -c.gripper_speed_m_s*n.dt, c.gripper_speed_m_s*n.dt)
         action[:, 6] = (next_target-n.gripper_limits[:, 0])/ranges
-        transition = self.step_callback(action.ravel())
+        # Grippers are expert-side controls; the public inference action contains
+        # only the two end-effector XYZ/RPY deltas declared in alignbox3d.yml.
+        n.gripper_targets[:] = next_target
+        transition = self.step_callback(self.environment.native_action_to_interface(action.ravel()))
         self.frames += 1
         self.stage_counts[self.stage] = self.stage_counts.get(self.stage, 0) + 1
         self.peak_lift_m = max(self.peak_lift_m, float(n.pose[0][2] - n.control_height))
@@ -346,6 +352,7 @@ class GraspCarryExpert:
                 "initial_box_pose_world": self.initial_box_pose,
                 "config": asdict(self.config), "stage_frames": self.stage_counts,
                 "stage_trace": self.trace, "frames": self.frames, "peak_lift_m": self.peak_lift_m,
+                "stage_instructions": list(self.stage_instructions),
                 "stage_motion": self.stage_motion,
                 "sampled_grasp": {key: value.tolist() for key, value in self.sample.items()},
                 "measured_grasp": getattr(self, "grasp_capture", None)}
@@ -359,8 +366,9 @@ def collect_grasp_episode(environment, writer, seed, *, config=None, max_steps=6
             result = expert.run()
         except GraspFailure as error:
             return {**expert.metadata(), "success": False, "saved": False, "failure_reason": str(error)}
-        labels = [STAGE_LABELS[int(value[0])] for value in recorder.rows["language.stage_id"]]
-        result.update(recorder.save(writer, "environment", task=labels), saved=True)
+        instructions = [expert.stage_instructions[int(value[0])]
+                        for value in recorder.rows["language.stage_id"]]
+        result.update(recorder.save(writer, "environment", task=instructions), saved=True)
         return result
     finally:
         recorder.close()

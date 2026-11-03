@@ -1,0 +1,9 @@
+{
+  "environment": "pusht",
+  "fps": 10,
+  "action": ["action"],
+  "observation": {
+    "robot_state": ["robot.agent_pos"],
+    "env": ["images.front", "instruction"]
+  }
+}

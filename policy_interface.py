@@ -19,13 +19,7 @@ PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 1_048_576
 
 class PolicyInterface:
-    """Select algorithm inputs without changing the recorded dataset.
-
-    obs='state' returns the canonical state vector; 'keypoint' concatenates
-    object keypoints and agent positions; 'image' returns every RGB camera stream
-    plus agent positions (both cameras for AlignBox3D); 'all' returns every
-    recording observation.
-    """
+    """Return the named robot_state/env fields selected by the environment YAML."""
 
     def __init__(self, name="pusht", *, obs="state", render_size=None):
         if obs not in ("state", "keypoint", "image", "all"):
@@ -34,41 +28,37 @@ class PolicyInterface:
         self.obs = obs
 
     def observe(self):
-        if self.obs == "state":
-            return self.env.lerobot_observation(include_images=False)["observation.state"]
-        if self.obs == "keypoint":
-            return np.concatenate((self.env.get_keypoints().reshape(-1), self.env.get_agent_positions()))
-        if self.obs == "image":
-            snapshot = self.env.lerobot_observation()
-            images = {key: value.copy() for key, value in snapshot.items()
-                      if key.startswith("observation.images.")}
-            return {**images, "observation.agent_pos": self.env.get_agent_positions()}
-        return self.env.observe()
+        metadata = self.env.interface_observation()
+        return {group: {field: metadata[field] for field in fields}
+                for group, fields in self.env._interface_config["observation"].items()}
 
     def reset(self, seed=0):
         self.env.reset(seed)
         return self.observe()
 
     def step(self, action):
+        if isinstance(action, dict):
+            expected = self.env._interface_config["action"]
+            if set(action) != set(expected):
+                raise ValueError(f"Action fields must be exactly {expected}.")
+            features = self.env.lerobot_schema()["interface_features"]
+            values = []
+            for field in expected:
+                value = np.asarray(action[field], dtype=np.float32)
+                if value.shape != tuple(features[field]["shape"]):
+                    raise ValueError(f"Action field {field} must have shape {features[field]['shape']}.")
+                values.append(value)
+            action = np.concatenate(values)
         result = self.env.step(action)
         return replace(result, obs=self.observe())
 
     def contract(self):
         contract = self.env.contract()
-        schema = self.env.recording_schema()
-        if self.obs == "state":
-            keys = ("observation.state",)
-        elif self.obs == "keypoint":
-            keys = ("observation.keypoints", "observation.agent_pos")
-        elif self.obs == "image":
-            keys = tuple(key for key, feature in schema["features"].items()
-                         if feature["dtype"] == "video") + ("observation.agent_pos",)
-        else:
-            keys = tuple(key for key in schema["features"] if key.startswith("observation."))
-        contract.update(observation_mode=self.obs, fps=self.env.fps,
-                        input_features={key: schema["features"][key] for key in keys})
-        if self.obs in ("keypoint", "state"):
-            contract["input_dim"] = sum(schema["features"][key]["shape"][0] for key in keys)
+        features = contract["interface_features"]
+        fields = [field for group in contract["interface"]["observation"].values() for field in group]
+        contract.update(observation_mode="configured",
+                        input_features={field: features[field] for field in fields},
+                        output_features={field: features[field] for field in contract["interface"]["action"]})
         return contract
 
     def close(self):
@@ -141,6 +131,18 @@ def _rgb_history(images: np.ndarray) -> dict[str, Any]:
     return {"shape": list(images.shape), "data": base64.b64encode(images.tobytes()).decode("ascii")}
 
 
+def _interface_history(history, config):
+    """Keep field names on the wire; ActionExpert concatenates robot_state."""
+    result = {}
+    for group, fields in config["observation"].items():
+        result[group] = {}
+        for field in fields:
+            values = [frame[field] for frame in history]
+            result[group][field] = (_rgb_history(np.stack(values)) if field.startswith("images.")
+                                    else values if field == "instruction" else np.stack(values).tolist())
+    return result
+
+
 def _finish_transitions(environment: PushEnvironment, reason: str):
     """End a 3-D episode at its current pose without advancing physics."""
     if environment.environment.phase in ("complete", "failed"):
@@ -171,18 +173,31 @@ def run_rollout(
         or any(type(size) is not int or size < 1 for size in image_shape) or image_shape[-1] != 3
     ):
         raise ValueError("Policy RGB shape must be [height, width, 3].")
-    environment = make_environment(name, render_size=image_shape[1] if image_shape is not None else 96)
+    public_image_key = image_key.removeprefix("observation.")
+    source_shape = health.get("contract", {}).get("interface_features", {}).get(public_image_key, {}).get("shape")
+    render_size = source_shape[1] if source_shape else image_shape[1] if image_shape is not None else 96
+    environment = make_environment(name, render_size=render_size)
     scores: list[float] = []
     lengths: list[int] = []
     successes: list[bool] = []
     results: list[dict[str, Any]] = []
     spatial = environment.name == "alignbox3d"
     episode_in_progress = False
+    structured = bool(health.get("contract", {}).get("interface"))
+
+    def interface_snapshot():
+        fields = environment.interface_observation()
+        if image_shape is not None and list(fields[public_image_key].shape) != list(image_shape):
+            import cv2
+            fields[public_image_key] = cv2.resize(fields[public_image_key], (image_shape[1], image_shape[0]),
+                                                  interpolation=cv2.INTER_AREA)
+        return fields
+
     try:
         n_obs_steps, n_action_steps = validate_policy_contract(environment, health)
         if image_shape is not None:
             feature = environment.lerobot_schema()["features"].get(image_key)
-            if feature is None or feature["dtype"] != "video" or feature["shape"] != list(image_shape):
+            if feature is None or feature["dtype"] != "video" or (not structured and feature["shape"] != list(image_shape)):
                 raise RuntimeError("Policy/environment RGB camera or dimensions differ.")
             if 4 * ((n_obs_steps * int(np.prod(image_shape)) + 2) // 3) > MAX_MESSAGE_BYTES:
                 raise ValueError("Policy RGB history exceeds the 1 MiB message limit.")
@@ -193,10 +208,12 @@ def run_rollout(
             if not response.get("ok"):
                 raise RuntimeError(response.get("error", "Policy reset failed."))
             observation = environment.reset(episode_seed)
+            if structured:
+                observation = interface_snapshot()
             episode_in_progress = True
             history = deque((observation.copy() for _ in range(n_obs_steps)), maxlen=n_obs_steps)
             images = deque(maxlen=n_obs_steps)
-            if image_shape is not None:
+            if image_shape is not None and not structured:
                 frame = environment.lerobot_observation()[image_key]
                 images.extend(frame.copy() for _ in range(n_obs_steps))
             score = float("-inf")
@@ -209,8 +226,8 @@ def run_rollout(
             def consume(transition, *, update_inputs=True):
                 nonlocal score, steps, done, success, success_known, terminated, truncated
                 if update_inputs:
-                    history.append(transition.obs)
-                    if image_shape is not None:
+                    history.append(interface_snapshot() if structured else transition.obs)
+                    if image_shape is not None and not structured:
                         images.append(environment.lerobot_observation()[image_key])
                 if not np.isfinite(transition.reward):
                     raise ValueError("Environment reward must be finite.")
@@ -231,8 +248,9 @@ def run_rollout(
                 if spatial and environment.environment.phase != "control":
                     actions = environment.hold_action()[None, :]
                 else:
-                    observation = np.stack(history).tolist()
-                    if image_shape is not None:
+                    observation = (_interface_history(history, environment._interface_config)
+                                   if structured else np.stack(history).tolist())
+                    if image_shape is not None and not structured:
                         observation = {"observation.state": observation, "image": _rgb_history(np.stack(images))}
                     send_message(connection, {"op": "predict", "obs": observation})
                     response = receive_message(connection)
@@ -290,7 +308,8 @@ def run_rollout(
 def validate_policy_contract(environment: PushEnvironment, health: dict[str, Any]) -> tuple[int, int]:
     native = environment.contract()
     received = health.get("contract", {})
-    for key in ("obs_dim", "action_dim", "observation_layout", "action_semantics", "action_low", "action_high"):
+    for key in ("obs_dim", "action_dim", "observation_layout", "action_semantics", "action_low", "action_high",
+                "interface", "interface_features", "interface_semantics"):
         if received.get(key) != native[key]:
             raise RuntimeError(f"Policy/environment contract mismatch at {key}: {received.get(key)} != {native[key]}.")
     schema = environment.lerobot_schema()

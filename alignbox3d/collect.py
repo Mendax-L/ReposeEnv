@@ -18,7 +18,7 @@ from alignbox3d.diversity import DiverseAlignBox3DEnv, VISUAL_MODES
 from alignbox3d.grasp_collection import GraspConfig, EXPERT_STAGES
 from alignbox3d.parallel_collection import collection_attempts
 from alignbox3d.collection_metadata import metadata_dictionary
-from alignbox3d.stage_labels import STAGE_LABELS, language_metadata
+from alignbox3d.stage_labels import STAGE_INSTRUCTIONS, language_metadata
 
 
 def main():
@@ -88,7 +88,7 @@ def main():
                    "alignbox3d/native/env.py", "alignbox3d/native/model.py", "alignbox3d/native/kinematics.py",
                    "alignbox3d/diversity.py", "common/schema.py", "common/recording.py", "common/lerobot.py",
                    "common/files.py", "alignbox3d/collection_metadata.py", "alignbox3d/stage_labels.py",
-                   "alignbox3d/collect.py")
+                   "alignbox3d/collect.py", "common/environment.py", "common/config.py", "config/alignbox3d.yml")
         snapshots = {name: (base/name).read_bytes() for name in sources}
         schema = recording_schema(environment)
         schema["grasp_expert"] = {"config": asdict(config), "stages": list(EXPERT_STAGES),
@@ -103,7 +103,7 @@ def main():
             "source_snapshot": "meta/source_snapshot",
             "gripper_servo": {"kp_N_per_m": 2500, "kv_N_s_per_m": 40, "force_limit_N": 10},
             "runtime": {"python": sys.version, "mujoco": __import__("mujoco").__version__}}
-        writer = LeRobotWriter(output, schema, STAGE_LABELS[0],
+        writer = LeRobotWriter(output, schema, STAGE_INSTRUCTIONS[0][0],
             provenance=provenance, max_frames_per_file=1)
         for name, value in snapshots.items():
             path = output/"meta/source_snapshot"/name

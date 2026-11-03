@@ -7,6 +7,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
+from common.config import load_environment_config
 
 from .model import (ARM_NAMES, ARM_HOME,
                     TIP_ROTATIONS, UPPER_REST_Z, build_scene)
@@ -22,7 +23,7 @@ class StackedBoxesEnv(gym.Env):
     No automatic grasp, lift, height correction or landing is performed.
     """
 
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 60}
     control_height = UPPER_REST_Z
     initial_tip_positions = ((-.20, -.10, .362), (.20, -.10, .362))
     initial_finger_clearance_m = .020
@@ -55,6 +56,8 @@ class StackedBoxesEnv(gym.Env):
         self.initial_yaw_randomized = False
         self.model = mujoco.MjModel.from_xml_string(
             build_scene(offset, yaw) if scene_xml is None else scene_xml)
+        # Ten physics steps per control step at exactly 60 Hz.
+        self.model.opt.timestep = 1.0 / (10 * load_environment_config("alignbox3d")["fps"])
         self.data = mujoco.MjData(self.model)
         self.frame_skip = 10
         self.dt = self.model.opt.timestep * self.frame_skip
@@ -63,17 +66,12 @@ class StackedBoxesEnv(gym.Env):
             np.asarray([-1.] * 6 + [0.] + [-1.] * 6 + [0.], dtype=np.float32),
             np.ones(14, dtype=np.float32), dtype=np.float32)
         self.observation_space = spaces.Dict({
-            "box_pose": spaces.Box(-np.inf, np.inf, (7,), dtype=np.float64),
-            "box_velocity": spaces.Box(-np.inf, np.inf, (6,), dtype=np.float64),
-            "joint_positions": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float64),
-            "joint_velocities": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float64),
-            "tip_positions": spaces.Box(-np.inf, np.inf, (2, 3), dtype=np.float64),
-            "tip_targets": spaces.Box(-np.inf, np.inf, (2, 3), dtype=np.float64),
-            "alignment_error": spaces.Box(-np.inf, np.inf, (3,), dtype=np.float64),
-            "contact_forces": spaces.Box(0., np.inf, (2,), dtype=np.float64),
-            "gripper_positions": spaces.Box(-np.inf, np.inf, (2,), dtype=np.float64),
-            "gripper_targets": spaces.Box(0., np.inf, (2,), dtype=np.float64),
-            "tip_quaternions": spaces.Box(-1., 1., (2, 4), dtype=np.float64),
+            "robot.left_end_effector_pos": spaces.Box(-np.inf, np.inf, (3,), dtype=np.float64),
+            "robot.left_end_effector_rot6d": spaces.Box(-1., 1., (6,), dtype=np.float64),
+            "robot.left_gripper": spaces.Box(-np.inf, np.inf, (1,), dtype=np.float64),
+            "robot.right_end_effector_pos": spaces.Box(-np.inf, np.inf, (3,), dtype=np.float64),
+            "robot.right_end_effector_rot6d": spaces.Box(-1., 1., (6,), dtype=np.float64),
+            "robot.right_gripper": spaces.Box(-np.inf, np.inf, (1,), dtype=np.float64),
         })
         self.arm_qids = []
         self.arm_dofs = []
@@ -527,17 +525,17 @@ class StackedBoxesEnv(gym.Env):
                 "ik_clipped": bool(self.ik_clipped), "time": float(self.data.time)}
 
     def _observation(self):
-        pos, yaw = self.pose
-        return {"box_pose": self.data.qpos[self.box_qadr:self.box_qadr+7].copy(),
-                "box_velocity": self.data.qvel[self.box_dadr:self.box_dadr+6].copy(),
-                "joint_positions": self.data.qpos[self.qids].copy(),
-                "joint_velocities": self.data.qvel[self.dofs].copy(),
-                "tip_positions": self.tip_positions, "tip_targets": self.tip_targets.copy(),
-                "alignment_error": np.array([*pos[:2], yaw]),
-                "contact_forces": self.contact_forces.copy(),
-                "gripper_positions": self.gripper_positions,
-                "gripper_targets": self.gripper_targets.copy(),
-                "tip_quaternions": self.tip_quaternions}
+        positions = self.tip_positions
+        rotations = self.tip_rotations
+        grippers = self.gripper_positions
+        return {
+            "robot.left_end_effector_pos": positions[0],
+            "robot.left_end_effector_rot6d": rotations[0, :, :2].T.reshape(-1),
+            "robot.left_gripper": grippers[0:1],
+            "robot.right_end_effector_pos": positions[1],
+            "robot.right_end_effector_rot6d": rotations[1, :, :2].T.reshape(-1),
+            "robot.right_gripper": grippers[1:2],
+        }
 
     def render(self, camera="overview", render_size=None):
         if camera not in ("overview", "closeup"):

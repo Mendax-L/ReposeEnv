@@ -18,8 +18,9 @@ def make_environment(name: str, render_size: int | None = None) -> PushEnvironme
         from pushT.env import PushTEnv
         return PushTEnv(render_size)
     if name == "alignbox3d":
-        from alignbox3d.env import AlignBox3DEnv
-        return AlignBox3DEnv(render_size)
+        # The public/test environment uses the same industrial renderer as collection.
+        from alignbox3d.diversity import DiverseAlignBox3DEnv
+        return DiverseAlignBox3DEnv(render_size=render_size)
     raise ValueError(f"Unknown environment {name!r}; choose from {SUPPORTED_ENVIRONMENTS}.")
 
 

@@ -23,7 +23,7 @@ class SpatialTeleop:
 
     def act(self, observation=None, *, mouse=None, direction=(0, 0), yaw=0.,
             rotation=(0., 0., 0.), arm="both", gripper=None):
-        """Tool XYZ and right-handed world rotation-vector commands.
+        """Tool XYZ and right-handed local roll/pitch/yaw commands.
 
         arm selects inner, outer or both. The clockwise yaw shortcut
         rotates each selected tool about its own origin for keyboard use.
@@ -31,28 +31,32 @@ class SpatialTeleop:
         """
         direction = np.asarray(direction, dtype=np.float32)
         rotation = np.asarray(rotation, dtype=np.float32)
-        if (direction.shape not in ((2,), (3,), (14,)) or not np.isfinite(direction).all()
+        if (direction.shape not in ((2,), (3,), (12,)) or not np.isfinite(direction).all()
                 or rotation.shape != (3,) or not np.isfinite(rotation).all()
                 or not np.isfinite(yaw) or arm not in ("inner", "outer", "both")):
             raise ValueError("Control requires finite XYZ/rotation and arm inner, outer or both.")
         native = self.environment.environment
         if native.phase != "control":
-            return native.hold_action()
-        if direction.shape == (14,):
+            return self.environment.hold_action()
+        if direction.shape == (12,):
             if yaw or np.any(rotation) or gripper is not None:
-                raise ValueError("A full 14-D action cannot be combined with rotation or gripper arguments.")
+                raise ValueError("A full 12-D action cannot be combined with rotation or gripper arguments.")
             return np.clip(direction, self.environment.action_low, self.environment.action_high)
         translation = np.zeros(3)
         translation[:len(direction)] = np.clip(direction, -1, 1)
-        action = native.hold_action().reshape(2, 7)
+        action = self.environment.hold_action()
         indices = [0, 1] if arm == "both" else [0 if arm == "inner" else 1]
-        action[indices, :3] = translation
-        action[indices, 3:6] = np.clip(rotation, -1, 1)
-        action[indices, 5] -= yaw
+        for index in indices:
+            side = ("left", "right")[index]
+            action[self.environment.action_groups[f"action.{side}_end_effector_delta_xyz"]] = translation
+            action[self.environment.action_groups[f"action.{side}_end_effector_delta_rpy"]] = np.clip(
+                (rotation[0], rotation[1], rotation[2] - yaw), -1, 1)
         if gripper is not None:
             opening = np.asarray(gripper, dtype=np.float32)
             if opening.shape not in ((), (2,)) or not np.isfinite(opening).all():
                 raise ValueError("gripper must be a finite opening ratio or inner/outer pair")
             values = np.full(2, opening.item()) if opening.shape == () else opening
-            action[indices, 6] = np.clip(values[indices], 0, 1)
+            ranges = np.diff(native.gripper_limits, axis=1).ravel()
+            native.gripper_targets[indices] = (native.gripper_limits[indices, 0]
+                                                + np.clip(values[indices], 0, 1) * ranges[indices])
         return np.clip(action.ravel(), self.environment.action_low, self.environment.action_high)

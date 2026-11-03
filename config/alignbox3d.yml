@@ -1,0 +1,21 @@
+{
+  "environment": "alignbox3d",
+  "fps": 60,
+  "action": [
+    "action.left_end_effector_delta_xyz",
+    "action.left_end_effector_delta_rpy",
+    "action.right_end_effector_delta_xyz",
+    "action.right_end_effector_delta_rpy"
+  ],
+  "observation": {
+    "robot_state": [
+      "robot.left_end_effector_pos",
+      "robot.left_end_effector_rot6d",
+      "robot.left_gripper",
+      "robot.right_end_effector_pos",
+      "robot.right_end_effector_rot6d",
+      "robot.right_gripper"
+    ],
+    "env": ["images.camera2", "instruction"]
+  }
+}

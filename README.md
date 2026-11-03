@@ -84,10 +84,10 @@ python -m common.recording --env pusht --actions training_data/pusht_commands.np
 
 | 环境 | 状态维数 | 动作 | 频率 |
 | --- | ---: | --- | ---: |
-| `pusht` | 20 | 2 维 agent 绝对目标 XY，范围 `[0,512]` | 10 Hz |
-| `alignbox3d` | 66 | 每臂 XYZ/旋转向量增量＋夹爪绝对开度，共 14 维 | 50 Hz |
+| `pusht` | 2 | 2 维 agent 绝对目标 XY，范围 `[0,512]` | 10 Hz |
+| `alignbox3d` | 20 | 左右末端 XYZ 与局部 roll/pitch/yaw 增量，共 12 维 | 60 Hz |
 
-AlignBox3D 动作顺序为 `[inner.dx,dy,dz,rx,ry,rz,grip, outer.dx,dy,dz,rx,ry,rz,grip]`。位姿分量范围 `[-1,1]`，每步平移分量缩放 1 mm、旋转向量分量缩放 0.5°；旋转向量 = 方向表示旋转轴、长度表示旋转角的三维向量，使用共享世界坐标系右手方向。增量叠加到上一目标位姿。夹爪是绝对开度，`0` 全闭、`1` 全开，对应驱动手指行程 0–44 mm；`env.hold_action()` 保持当前目标位姿和夹爪开度。
+AlignBox3D 动作顺序由 `config/alignbox3d.yml` 定义：左末端 XYZ、左末端 RPY、右末端 XYZ、右末端 RPY。XYZ 使用世界坐标，RPY 使用末端局部坐标，按通用 roll、pitch、yaw 顺序排列；metadata 显式保存该顺序及组合公式 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。每步平移分量缩放 1 mm、旋转分量缩放 0.5°。夹爪只作为观测返回，不属于 Inference action。
 
 重置后夹爪张开并与箱体分离，最低指尖至少高于旋转后箱体最高点 20 mm；平放时工具参考点 Z=0.362 m，最大初始倾斜时约 0.408 m。环境由动作直接控制末端，不执行隐式抓取或升降。
 
@@ -104,16 +104,7 @@ finally:
     env.close()
 ```
 
-两个末端共用 MuJoCo 世界坐标系，XY 原点为下箱中心，桌面 Z=0.080 m；四元数按 WXYZ 排列，表示工具到世界的朝向。66 维状态的零起始切片如下：
-
-| 切片 | 内容 |
-| --- | --- |
-| `[0:7]` / `[7:13]` | 上箱底面中心 XYZ/WXYZ、线速度与角速度 |
-| `[13:25]` / `[25:37]` | 双臂关节位置、速度 |
-| `[37:40]` / `[40:43]` | inner、outer 实际绝对 XYZ |
-| `[43:49]` / `[49:52]` / `[52:54]` | 双末端目标 XYZ、箱体 XY/yaw 误差、双臂接触力 |
-| `[54:56]` / `[56:58]` | 两夹爪实际、目标驱动手指行程，单位 m |
-| `[58:62]` / `[62:66]` | inner、outer 实际绝对 WXYZ |
+两个末端共用 MuJoCo 世界坐标系，XY 原点为下箱中心，桌面 Z=0.080 m。公共 robot state 只包含左右末端 XYZ、Rot6D 和夹爪位置，共 20 维；公共字段使用 `robot.left_end_effector_pos` 等名称，相机使用 `images.camera2`。旋转字段后缀约定为 `rot6d`、`wxyz` 或 `rotm`，分别表示 Rot6D、WXYZ 四元数和行优先 3×3 旋转矩阵。
 
 箱体 yaw 为顺时针正，与原生右手四元数解出的 Z 角符号相反。`step()` 返回 `StepResult`，包含 `obs/reward/done/info/terminated/truncated`；其他公共方法包括 `reset/observe/render/get_keypoints/get_agent_positions/teleop_agent/contract/close`。
 
@@ -123,15 +114,15 @@ finally:
 
 LeRobot v3.0 = Parquet 数值数据、同步 MP4 视频和字段/轨迹元数据组成的数据格式。每帧保存动作前观测和动作，`next.*` 保存动作后结果；两个相机同时采集，视频采用 H.264，不含界面或动作标记。
 
-每批目录包含 `data/`、`videos/`、`meta/info.json`、`meta/stats.json`、`meta/tasks.parquet`、`meta/episodes/`、`meta/pushenv_schema.json` 与 `meta/provenance.json`。`pushenv_schema.json` 保留固定格式名以兼容已有数据；`observation.end_effector_poses` 保存两末端 XYZ/WXYZ，展开为 14 维。自动示范额外保存采集报告、源码快照、视觉字典及语言字典。
+每批目录包含 `data/`、`videos/`、`meta/info.json`、`meta/stats.json`、`meta/tasks.parquet`、`meta/episodes/`、`meta/pushenv_schema.json` 与 `meta/provenance.json`。`pushenv_schema.json` 保留固定格式名以兼容已有数据；公共观测字段由环境 YAML 决定。自动示范额外保存采集报告、源码快照、视觉字典及语言字典。
 
-逐帧语言标签固定为：**接近 → 加紧 → 抬起 → 搬运对齐 → 放下 → 松开撤离**。`language.stage_id` 为 0–5，`language.stage` 为对应的 6 维独热向量 = 该阶段位置为 1、其余为 0；每帧 `task_index` 指向 `meta/tasks.parquet` 中相应中文标签。未标注时 ID 为 -1、向量全零。这些字段独立于 66 维物理状态与 14 维动作；15 个内部控制子阶段由 `alignbox3d/stage_labels.py` 统一映射为六个语言标签。
+逐帧语言阶段固定为：**接近 → 加紧 → 抬起 → 搬运对齐 → 放下 → 松开撤离**。每个阶段提供 4 种完整中文指令，例如“请保持双臂协同，平稳抬起已经夹紧的上箱。”；每条轨迹按 seed 为各阶段选择一句，同一阶段（含内部子阶段）保持不变，且不影响物理随机采样。`language.stage_id` 为 0–5，`language.stage` 为对应的 6 维独热向量；每帧 `task_index` 指向 `meta/tasks.parquet` 中实际使用的完整句子，不能当作阶段 ID。全部候选句与阶段关系保存在 `meta/language.json` 和 schema 中，采集报告记录该轨迹所选句子。未标注时 ID 为 -1、向量全零。这些字段独立于 20 维 robot state 与 12 维动作；15 个内部控制子阶段由 `alignbox3d/stage_labels.py` 统一映射为六个语言阶段。
 
 `collection.*` 保存抓点、扰动、内部阶段和视觉参数，作为采集元数据。数据校验检查阶段 ID、独热向量和任务文本的一致性。`meta/collection.json` 记录所有尝试与拒绝原因；`meta/provenance.json` 记录参数、运行版本和源码指纹。
 
 ## 策略接口
 
-`PolicyInterface` 根据模型选择 state/keypoint/image/all 观测，录制仍保留所有原生观测和双相机。导出契约不需要模型服务：
+`PolicyInterface` 对两个环境统一返回 YAML 选定的字段：`robot_state` 中是 `robot.*`，`env` 中是 `images.*` 与 `instruction`。接口字段的维度、单位、RPY 顺序和坐标系由原生 metadata 定义，YAML 只列出最终所需字段。导出契约不需要模型服务：
 
 ```powershell
 python policy_interface.py --env alignbox3d --obs image --export-contract training_data/alignbox3d_contract.json
@@ -139,3 +130,5 @@ python policy_interface.py --env alignbox3d --host 127.0.0.1 --port 8765 --episo
 ```
 
 模型侧在 ActionExpert 环境运行；仿真侧在 ReposeEnv 环境运行。TCP = 本机或网络进程之间的通信连接，策略启动时核对维数、字段顺序、单位和动作语义。
+
+在线 `predict.obs` 保留 `robot_state` 和 `env` 的命名字段；图像用 RGB uint8 HWC 的 shape/base64 编码，指令使用自然语言字符串（历史窗口使用字符串列表）。ActionExpert 按 checkpoint 中保存的 YAML 顺序拼接 `robot_state`，与训练的 `observation.state` 完全一致。数据落盘时相机才使用 LeRobot 的 `observation.images.camera2` / `observation.images.front`，语言通过逐帧 `task_index` 关联 `meta/tasks.parquet`。观测、图像和语言都是动作前同一时刻的数据。字段顺序、旋转语义或 FPS 改变后需重新采集和训练，旧 checkpoint 不会自动转换。

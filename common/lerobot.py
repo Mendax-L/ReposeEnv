@@ -569,8 +569,24 @@ def validate_dataset(root: str | Path) -> dict[str, Any]:
         expected_vectors[labelled] = np.eye(len(labels))[stage_ids[labelled]]
         if not np.array_equal(vectors, expected_vectors):
             raise ValueError("Language stage IDs and one-hot vectors disagree.")
-        tasks = task_frame.index.to_numpy()[frame_task_indices[labelled]]
-        if not np.array_equal(tasks, labels[stage_ids[labelled]]):
+        # Resolve the vocabulary stored with this dataset, so old short labels
+        # and newer sentence variants remain valid without simulator imports.
+        instruction_stages = {text: index for index, text in enumerate(labels)}
+        schema_path = root / "meta/pushenv_schema.json"
+        if schema_path.is_file():
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            for label in schema.get("language_stages", {}).get("labels", []):
+                stage_id = label["id"]
+                if (type(stage_id) is not int or not 0 <= stage_id < len(labels)
+                        or label["text"] != labels[stage_id]):
+                    raise ValueError("Language vocabulary disagrees with the stage labels.")
+                for text in label.get("instructions", []):
+                    if (not isinstance(text, str) or not text.strip()
+                            or instruction_stages.get(text, stage_id) != stage_id):
+                        raise ValueError("Language instructions must belong to exactly one stage.")
+                    instruction_stages[text] = stage_id
+        task_stages = np.asarray([instruction_stages.get(text, -2) for text in task_frame.index])
+        if not np.array_equal(task_stages[frame_task_indices[labelled]], stage_ids[labelled]):
             raise ValueError("Frame task text disagrees with its language stage label.")
     for episode in episodes:
         names = episode.get("tasks")
