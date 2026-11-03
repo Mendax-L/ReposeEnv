@@ -14,7 +14,7 @@ class AlignBox3DEnv(PushEnvironment):
     action_low = ((-1.0,) * 6 + (0.0,)) * 2
     action_high = (1.0,) * 14
     observation_layout = "left_right_end_effector_pos_rot6d_gripper/v1"
-    action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v3"
+    action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v4"
 
     def __init__(self, render_size: int = 512) -> None:
         from .native.env import StackedBoxesEnv

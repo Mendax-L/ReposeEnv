@@ -41,8 +41,10 @@ def get_environment_schema(name: str, image_shape: Sequence[int] | None = None) 
                     semantics[key]["coordinate_frame"] = "world"
                 else:
                     semantics[key]["measurement"] = "Measured driven-finger slide travel, not the gap between pads."
-            for suffix, components, scale in (("xyz", list("xyz"), .001),
-                                               ("rpy", ["roll", "pitch", "yaw"], math.radians(.5))):
+            for suffix, components, scale in (
+                ("xyz", list("xyz"), config["translation_speed_m_s"] / config["fps"]),
+                ("rpy", ["roll", "pitch", "yaw"], math.radians(config["rotation_speed_deg_s"]) / config["fps"]),
+            ):
                 key = f"action.{side}_end_effector_delta_{suffix}"
                 available[key] = _vector(components)
                 semantics[key] = {"components": components, "units": ["normalized_delta"] * 3,
@@ -64,7 +66,7 @@ def get_environment_schema(name: str, image_shape: Sequence[int] | None = None) 
         camera = "images.camera2"
         camera_shape = [max(2, 2 * round(shape[0] * .3)), shape[1], 3]
         layout = "configured_robot_fields/v2"
-        action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v3"
+        action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v4"
         termination = "Alignment and stable release are evaluated by the native simulator; time/manual limits are truncated."
     else:
         available["robot.agent_pos"] = _vector(["x", "y"])
@@ -108,6 +110,8 @@ def get_environment_schema(name: str, image_shape: Sequence[int] | None = None) 
             feature_semantics[f"observation.{key}"] = semantics[key]
     return {
         "environment": name, "robot_type": name, "fps": config["fps"],
+        "timing": {"policy_hz": config["fps"], "recording_hz": config["fps"],
+                   "control_hz": config["control_hz"], "physics_hz": config["physics_hz"]},
         "observation_layout": layout, "action_semantics": action_semantics,
         "features": features, "feature_semantics": feature_semantics, "termination": termination,
         "interface": config, "interface_features": interface_features,

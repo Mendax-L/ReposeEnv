@@ -49,7 +49,7 @@ python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
 | --- | ---: | --- |
 | `--seed` | 500000 | 首次尝试的随机种子，后续依次递增 |
 | `--render-size` | 256 | 两相机录制宽度 |
-| `--max-steps` | 6000 | 单次尝试的动作步数上限 |
+| `--max-steps` | 3000 | 单次尝试的动作步数上限，默认按 YAML 的采样频率保留 100 s |
 | `--approach-speed-mm-s` / `--withdraw-speed-mm-s` | 50 | 空载接近、撤离速度上限 |
 | `--contact-speed-mm-s` | 15 | 箱沿附近接近、退出速度上限 |
 | `--lift-speed-mm-s` / `--carry-speed-mm-s` / `--lower-speed-mm-s` | 20 | 抬起、搬运、放下速度上限 |
@@ -59,7 +59,7 @@ python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
 
 夹爪用五次平滑曲线渐进开合，默认 12 mm 行程变化约需 5.6 s，再停稳至少 0.4 s。闭合时箱体异常升起超过 1.5 mm 或峰值速度超过 25 mm/s，该尝试会被拒绝。运动默认不启用额外加速度限制；需要时用 `--acceleration-mm-s2` 指定。其余随机范围和选项见 `python -m alignbox3d.collect --help`。
 
-末端跟踪的停稳判据使用实测末端的帧间位姿变化：连续 10 帧满足实测平移速度 <1.5 mm/s、角速度 <0.5°/s，并且位置误差 <1 mm、朝向误差 <0.5°。60 Hz 下这对应约 0.167 s，每帧位移 <0.025 mm、角变化 <0.0083°；等待上限 2.5 s。常量集中在 `alignbox3d/grasp_collection.py` 的 `TOOL_STILL_*` / `TOOL_SETTLE_TIMEOUT_S`。固定位置偏差不会产生帧间位移，因此不会再将 P 控制器用于补偿静载的指令速度当成实际运动。
+末端跟踪的停稳判据使用实测末端的帧间位姿变化：连续 10 帧满足实测平移速度 <1.5 mm/s、角速度 <0.5°/s，并且位置误差 <1 mm、朝向误差 <0.5°。默认 30 Hz 下这对应约 0.333 s，每帧位移 <0.05 mm、角变化 <0.0167°；等待上限 2.5 s。常量集中在 `alignbox3d/grasp_collection.py` 的 `TOOL_STILL_*` / `TOOL_SETTLE_TIMEOUT_S`。固定位置偏差不会产生帧间位移，因此不会再将 P 控制器用于补偿静载的指令速度当成实际运动。
 
 ### 视觉随机化
 
@@ -84,12 +84,16 @@ python -m common.recording --env pusht --actions training_data/pusht_commands.np
 
 契约 = 环境与模型共同遵守的字段、单位、动作顺序和采样频率。
 
-| 环境 | 状态维数 | 动作 | 频率 |
+| 环境 | 状态维数 | 动作 | 策略/采样频率 |
 | --- | ---: | --- | ---: |
 | `pusht` | 2 | 2 维 agent 绝对目标 XY，范围 `[0,512]` | 10 Hz |
-| `alignbox3d` | 20 | 左右末端 XYZ、局部 roll/pitch/yaw 增量及夹爪绝对开度，共 14 维 | 60 Hz |
+| `alignbox3d` | 20 | 左右末端 XYZ、局部 roll/pitch/yaw 增量及夹爪绝对开度，共 14 维 | 30 Hz |
 
-AlignBox3D 动作顺序由 `config/alignbox3d.yml` 定义：左末端 XYZ、左末端 RPY、左夹爪开度、右末端 XYZ、右末端 RPY、右夹爪开度。XYZ 使用世界坐标，RPY 使用末端局部坐标，按通用 roll、pitch、yaw 顺序排列；metadata 显式保存该顺序及组合公式 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。XYZ/RPY 分量范围为 `[-1,1]`，每步分别缩放 1 mm、0.5°；这是每轴的目标增量，60 Hz 下单轴目标速度上限为 60 mm/s，三轴满幅约为 104 mm/s，实测末端运动仍取决于 IK 和伺服跟踪。`action.left_gripper`、`action.right_gripper` 是 `[0,1]` 的绝对开度比例，0 全闭、1 全开，映射驱动手指行程 0–44 mm。全零动作会闭合夹爪；保持当前目标位姿与开度请使用 `env.hold_action()`。`robot.*_gripper` 观测仍是实测手指行程，单位 m。
+三个频率均写在环境 YAML 中：`fps` 是策略动作与数据采样频率，`control_hz` 是控制器目标更新频率，`physics_hz` 是物理积分频率。AlignBox3D 默认为 30/60/600 Hz；每个策略步用两次控制更新插值位置、朝向和夹爪目标，每次更新执行 10 个物理子步，只保存一帧观测和动作。PushT 保持 10/10/100 Hz。频率必须为正整数，后两项分别是前一项的整数倍；PushT 当前要求 `control_hz == fps`。
+
+AlignBox3D 动作顺序由 `config/alignbox3d.yml` 定义：左末端 XYZ、左末端 RPY、左夹爪开度、右末端 XYZ、右末端 RPY、右夹爪开度。XYZ 使用世界坐标，RPY 使用末端局部坐标，按通用 roll、pitch、yaw 顺序排列；metadata 显式保存该顺序及组合公式 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。XYZ/RPY 分量范围为 `[-1,1]`，步长由 YAML 的 `translation_speed_m_s: 0.06`、`rotation_speed_deg_s: 30.0` 除以 `fps` 得到：30 Hz 下每个分量每策略步分别缩放 2 mm、1°，经 60 Hz 插值后每次目标更新为 1 mm、0.5°。这些限制按分量计算，单轴目标速度上限为 60 mm/s，三轴满幅约为 104 mm/s；实测末端运动仍取决于 IK 和伺服跟踪。`action.left_gripper`、`action.right_gripper` 是 `[0,1]` 的绝对开度比例，0 全闭、1 全开，映射驱动手指行程 0–44 mm。全零动作会闭合夹爪；保持当前目标位姿与开度请使用 `env.hold_action()`。`robot.*_gripper` 观测仍是实测手指行程，单位 m。
+
+频率和步长语义随数据集、接口契约和 checkpoint 保存，其中 `timing` 记录 policy/recording/control/physics 四项频率。AlignBox3D 当前动作语义版本为 `dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v4`；旧数据与 checkpoint 应匹配原环境，新配置需重新采集和训练。策略频率表示动作执行的仿真时间间隔；一次预测可返回多个动作，模型请求频率由执行的动作数决定，也不保证仿真实时运行。
 
 重置后夹爪张开并与箱体分离，最低指尖至少高于旋转后箱体最高点 20 mm；平放时工具参考点 Z=0.362 m，最大初始倾斜时约 0.408 m。环境由动作直接控制末端，不执行隐式抓取或升降。
 

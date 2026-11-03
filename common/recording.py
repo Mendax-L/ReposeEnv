@@ -286,7 +286,9 @@ def main(default_env="pusht", argv=None):
         return
     args.episodes = 0 if args.episodes is None else args.episodes
     args.render_size = (512 if args.env == "alignbox3d" else 96) if args.render_size is None else args.render_size
-    max_steps = args.max_steps if args.max_steps is not None else (6000 if args.env == "alignbox3d" else 3000)
+    from .config import load_environment_config
+    max_steps = args.max_steps if args.max_steps is not None else (
+        100 * load_environment_config(args.env)["fps"] if args.env == "alignbox3d" else 3000)
     if max_steps < 1 or args.episodes < 0 or not 0 <= args.seed < 2**63:
         parser.error("max-steps must be positive; episodes nonnegative; seed in [0, 2**63)")
     if args.render_size < 16 or args.render_size % 2:

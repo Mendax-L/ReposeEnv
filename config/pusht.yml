@@ -1,6 +1,8 @@
 {
   "environment": "pusht",
   "fps": 10,
+  "control_hz": 10,
+  "physics_hz": 100,
   "action": ["action"],
   "observation": {
     "robot_state": ["robot.agent_pos"],

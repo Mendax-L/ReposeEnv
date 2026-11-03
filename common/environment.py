@@ -96,7 +96,7 @@ class PushEnvironment:
 
     @property
     def fps(self) -> int:
-        """Control/sampling frequency, independent of physics substeps."""
+        """Policy/data sampling frequency, independent of interpolation and physics."""
         frequency = (1.0 / self.environment.dt if self.name == "alignbox3d"
                      else self.environment.control_hz)
         if not np.isclose(frequency, round(frequency)) or frequency <= 0:
@@ -139,6 +139,7 @@ class PushEnvironment:
             "observation_names": schema["features"]["observation.state"]["names"],
             "action_names": schema["features"]["action"]["names"],
             "fps": self.fps,
+            "timing": schema["timing"],
             "interface": self._interface_config,
             "interface_features": schema["interface_features"],
             "interface_semantics": schema["interface_semantics"],

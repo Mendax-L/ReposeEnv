@@ -311,7 +311,7 @@ def validate_policy_contract(environment: PushEnvironment, health: dict[str, Any
     native = environment.contract()
     received = health.get("contract", {})
     for key in ("obs_dim", "action_dim", "observation_layout", "action_semantics", "action_low", "action_high",
-                "interface", "interface_features", "interface_semantics"):
+                "interface", "interface_features", "interface_semantics", "timing"):
         if received.get(key) != native[key]:
             raise RuntimeError(f"Policy/environment contract mismatch at {key}: {received.get(key)} != {native[key]}.")
     schema = environment.lerobot_schema()

@@ -1,6 +1,10 @@
 {
   "environment": "alignbox3d",
-  "fps": 60,
+  "fps": 30,
+  "control_hz": 60,
+  "physics_hz": 600,
+  "translation_speed_m_s": 0.06,
+  "rotation_speed_deg_s": 30.0,
   "action": [
     "action.left_end_effector_delta_xyz",
     "action.left_end_effector_delta_rpy",

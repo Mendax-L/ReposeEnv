@@ -14,6 +14,7 @@ import numpy as np
 from common.lerobot import LeRobotWriter, validate_dataset
 from common.files import write_json
 from common.recording import recording_schema
+from common.config import load_environment_config
 from alignbox3d.diversity import DiverseAlignBox3DEnv, VISUAL_MODES
 from alignbox3d.grasp_collection import GraspConfig, EXPERT_STAGES
 from alignbox3d.parallel_collection import collection_attempts
@@ -29,7 +30,7 @@ def main():
     parser.add_argument("--seed", type=int, default=500000)
     parser.add_argument("--render-size", type=int, default=256)
     parser.add_argument("--visual-mode", choices=VISUAL_MODES, default="all")
-    parser.add_argument("--max-steps", type=int, default=6000)
+    parser.add_argument("--max-steps", type=int, default=100 * load_environment_config("alignbox3d")["fps"])
     parser.add_argument("--workers", type=int, default=1, help="Independent simulation processes; successful episodes merge in seed order.")
     parser.add_argument("--approach-speed-mm-s", type=float, default=50.)
     parser.add_argument("--withdraw-speed-mm-s", type=float, default=50.)

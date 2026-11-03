@@ -9,8 +9,8 @@ from .native.model import BOX_SIZE, GRIP_POINTS
 from .stage_labels import EXPERT_STAGES, EXPERT_STAGE_LABEL_IDS, STAGE_LABELS, sample_stage_instructions
 FREE_TOOL_STAGES = frozenset(("approach_above", "approach_rim", "orient_grasp",
                               "withdraw_orient", "withdraw_above", "park"))
-# Require measured stillness for 10 control intervals (1/6 s at 60 Hz).
-# Per-frame thresholds are speed * dt: 25 um and 0.0083 deg at 60 Hz.
+# Require measured stillness for 10 policy intervals (1/3 s at the default 30 Hz).
+# Per-frame thresholds are speed * dt: 50 um and 0.0167 deg at 30 Hz.
 TOOL_STILL_FRAMES = 10
 TOOL_STILL_LINEAR_SPEED_M_S = .0015
 TOOL_STILL_ANGULAR_SPEED_RAD_S = math.radians(.5)
@@ -84,14 +84,14 @@ class GraspFailure(RuntimeError):
 
 
 class GraspCarryExpert:
-    def __init__(self, environment, seed, *, config=None, step=None, max_steps=6000):
+    def __init__(self, environment, seed, *, config=None, step=None, max_steps=None):
         self.environment = environment
         self.native = environment.environment
         self.config = config or GraspConfig()
         self.seed = int(seed)
         self.stage_instructions = sample_stage_instructions(self.seed)
         self.step_callback = environment.step if step is None else step
-        self.max_steps = max_steps
+        self.max_steps = max_steps if max_steps is not None else math.ceil(100 / self.native.dt)
         self.frames = 0
         self.stage_counts = {}
         self.stage = "initial_settle"
@@ -150,19 +150,20 @@ class GraspCarryExpert:
         return (self.config.free_angular_speed_degrees_s if self.stage in FREE_TOOL_STAGES
                 else self.config.angular_speed_degrees_s)
 
-    def tick(self, positions, rotations, opening, *, feedback=.05, allow_complete=False):
+    def tick(self, positions, rotations, opening, *, feedback=3., allow_complete=False):
+        """Track poses with a feedback gain in 1/s, independent of sample rate."""
         n, c = self.native, self.config
         if self.frames >= self.max_steps:
             raise GraspFailure("episode_step_limit")
         action = n.hold_action().reshape(2, 7)
-        desired_velocity = self.limit_norm(feedback*(positions-n.tip_positions)/n.dt, self.speed_limit())
+        desired_velocity = self.limit_norm(feedback*(positions-n.tip_positions), self.speed_limit())
         linear_velocity = (self.previous_linear_velocity + self.limit_norm(
             desired_velocity-self.previous_linear_velocity, c.linear_acceleration_m_s2*n.dt)
             if c.limit_motion_acceleration else desired_velocity)
-        action[:, :3] = linear_velocity*n.dt/.001
+        action[:, :3] = linear_velocity*n.dt/n.translation_action_scale
         for arm in range(2):
             desired_angular_velocity = self.limit_norm(
-                feedback*rotation_vector(rotations[arm]@n.tip_rotations[arm].T)/n.dt,
+                feedback*rotation_vector(rotations[arm]@n.tip_rotations[arm].T),
                 math.radians(self.angular_speed_limit()))
             angular_velocity = (self.previous_angular_velocity[arm] + self.limit_norm(
                 desired_angular_velocity-self.previous_angular_velocity[arm],
@@ -200,7 +201,7 @@ class GraspCarryExpert:
                     for end, start in zip(rotations, start_rotations))
         duration = max(.3, 1.875*distance/(speed or self.speed_limit()),
                        1.875*angle/math.radians(self.angular_speed_limit()))
-        feedback = .15 if name in FREE_TOOL_STAGES else .05
+        feedback = 9. if name in FREE_TOOL_STAGES else 3.
         if duration > c.stage_timeout_s:
             raise GraspFailure(f"planned_stage_timeout:{name}")
         for index in range(max(1, math.ceil(duration/n.dt))):
@@ -238,7 +239,7 @@ class GraspCarryExpert:
         if duration > c.stage_timeout_s:
             raise GraspFailure(f"planned_stage_timeout:{name}")
         stable = 0
-        for index in range(math.ceil(duration/n.dt) + 300):
+        for index in range(math.ceil((duration + 5.)/n.dt)):
             fraction = smoothstep(min(1., (index + 1)*n.dt/duration))
             target_centre = start + fraction*(centre-start)
             target_rotation = n._interpolate_rotation(start_rotation, rotation, fraction)
@@ -274,7 +275,7 @@ class GraspCarryExpert:
             fraction = smoothstep((index+1)*n.dt/duration)
             self.tick(positions, rotations, start+fraction*(target-start))
         stable = 0
-        for _ in range(150):
+        for _ in range(math.ceil(2.5/n.dt)):
             self.tick(positions, rotations, target)
             velocity = n.data.qvel[n.box_dadr:n.box_dadr+6]
             reached = np.max(np.abs(n.hold_action().reshape(2, 7)[:, 6]-target)) < 1e-5
@@ -292,12 +293,12 @@ class GraspCarryExpert:
         n.terminate_on_alignment = False
         self.stage_start("initial_settle")
         stable = 0
-        for index in range(150):
+        for index in range(math.ceil(2.5/n.dt)):
             self.tick(np.asarray(n.initial_tip_positions), n.initial_tip_rotations,
                       n.hold_action().reshape(2, 7)[:, 6])
             velocity = n.data.qvel[n.box_dadr:n.box_dadr+6]
             stable = stable+1 if np.linalg.norm(velocity) < .003 else 0
-            if index >= 19 and stable >= 10:
+            if (index + 1)*n.dt >= 1/3 and stable >= math.ceil((1/6)/n.dt):
                 break
         else:
             raise GraspFailure("initial_box_not_settled")
@@ -350,7 +351,7 @@ class GraspCarryExpert:
         self.stage_start("verify_released_alignment")
         n.terminate_on_alignment = True
         n.stable_steps = 0
-        for _ in range(100):
+        for _ in range(math.ceil(2./n.dt)):
             transition = self.tick(np.asarray(n.initial_tip_positions), n.initial_tip_rotations,
                                    opening, allow_complete=True)
             if transition.done:
@@ -370,7 +371,7 @@ class GraspCarryExpert:
                 "measured_grasp": getattr(self, "grasp_capture", None)}
 
 
-def collect_grasp_episode(environment, writer, seed, *, config=None, max_steps=6000):
+def collect_grasp_episode(environment, writer, seed, *, config=None, max_steps=None):
     recorder = EpisodeRecorder(environment, buffer_dir=getattr(writer, "root", None))
     expert = GraspCarryExpert(environment, seed, config=config, step=recorder.step, max_steps=max_steps)
     try:

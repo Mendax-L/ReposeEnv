@@ -10,6 +10,7 @@ from pymunk.vec2d import Vec2d
 import shapely.geometry as sg
 import cv2
 import skimage.transform as st
+from common.config import load_environment_config
 from .rendering import DrawOptions
 
 
@@ -40,10 +41,12 @@ class PushTEnv(gym.Env):
         self.seed()
         self.window_size = ws = 512  # The size of the PyGame window
         self.render_size = render_size
-        self.sim_hz = 100
+        config = load_environment_config("pusht")
+        self.sim_hz = config["physics_hz"]
         # Local controller params.
         self.k_p, self.k_v = 100, 20    # PD control.z
-        self.control_hz = self.metadata['video.frames_per_second']
+        self.control_hz = config["control_hz"]
+        self.metadata = {**self.metadata, 'video.frames_per_second': config["fps"]}
         # legcay set_state for data compatibility
         self.legacy = legacy
 

@@ -23,7 +23,7 @@ class StackedBoxesEnv(gym.Env):
     No automatic grasp, lift, height correction or landing is performed.
     """
 
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 60}
+    metadata = {"render_modes": ["rgb_array"]}
     control_height = UPPER_REST_Z
     initial_tip_positions = ((-.20, -.10, .362), (.20, -.10, .362))
     initial_finger_clearance_m = .020
@@ -39,7 +39,6 @@ class StackedBoxesEnv(gym.Env):
     initial_yaw_high = math.radians(8.)
     minimum_initial_yaw = math.radians(3.)
     yaw_limit = math.radians(12.)
-    rotation_action_scale = math.radians(.5)
     initial_tilt_range = math.radians(2.)
     initial_tilt_limit = math.radians(5.)
 
@@ -56,11 +55,18 @@ class StackedBoxesEnv(gym.Env):
         self.initial_yaw_randomized = False
         self.model = mujoco.MjModel.from_xml_string(
             build_scene(offset, yaw) if scene_xml is None else scene_xml)
-        # Ten physics steps per control step at exactly 60 Hz.
-        self.model.opt.timestep = 1.0 / (10 * load_environment_config("alignbox3d")["fps"])
+        config = load_environment_config("alignbox3d")
+        self.policy_hz = config["fps"]
+        self.control_hz = config["control_hz"]
+        self.physics_hz = config["physics_hz"]
+        self.control_steps = self.control_hz // self.policy_hz
+        self.frame_skip = self.physics_hz // self.control_hz
+        self.dt = 1.0 / self.policy_hz
+        self.translation_action_scale = config["translation_speed_m_s"] * self.dt
+        self.rotation_action_scale = math.radians(config["rotation_speed_deg_s"]) * self.dt
+        self.metadata = {**self.metadata, "render_fps": self.policy_hz}
+        self.model.opt.timestep = 1.0 / self.physics_hz
         self.data = mujoco.MjData(self.model)
-        self.frame_skip = 10
-        self.dt = self.model.opt.timestep * self.frame_skip
         self.max_steps = int(max_episode_seconds / self.dt)
         self.action_space = spaces.Box(
             np.asarray([-1.] * 6 + [0.] + [-1.] * 6 + [0.], dtype=np.float32),
@@ -442,24 +448,33 @@ class StackedBoxesEnv(gym.Env):
             return self._observation(), self._reward(info), terminated, not terminated, info
         self.ik_clipped = False
         commands = np.clip(action, self.action_space.low, self.action_space.high).reshape(2, 7)
-        targets = self.tip_targets + commands[:, :3] * .001
+        start_targets = self.tip_targets.copy()
+        start_rotations = self.tip_target_rotations.copy()
+        start_grippers = self.gripper_targets.copy()
+        targets = start_targets + commands[:, :3] * self.translation_action_scale
         rotations = np.asarray([
             self._rotation_increment(command[3:6] * self.rotation_action_scale) @ rotation
-            for command, rotation in zip(commands, self.tip_target_rotations)])
-        self.set_targets(targets, rotations)
-        self.gripper_targets[:] = (self.gripper_limits[:, 0]
-                                   + commands[:, 6] * np.diff(self.gripper_limits, axis=1).ravel())
-        for i in range(2):
-            self.data.ctrl[self.arm_aids[i]] = self.ik_q[i]
-            self.data.ctrl[self.gripper_aids[i]] = self.gripper_targets[i]
+            for command, rotation in zip(commands, start_rotations)])
+        grippers = (self.gripper_limits[:, 0]
+                    + commands[:, 6] * np.diff(self.gripper_limits, axis=1).ravel())
         forces = np.zeros(2)
-        for _ in range(self.frame_skip):
-            mujoco.mj_step(self.model, self.data)
-            current = self._read_contact_forces()
-            forces += current / self.frame_skip
-            self.peak_forces = np.maximum(self.peak_forces, current)
-            self.had_contact |= current > .03
-        mujoco.mj_forward(self.model, self.data)
+        for control_step in range(self.control_steps):
+            fraction = (control_step + 1) / self.control_steps
+            interpolated_rotations = np.asarray([
+                self._interpolate_rotation(start, end, fraction)
+                for start, end in zip(start_rotations, rotations)])
+            self.set_targets(start_targets + fraction * (targets - start_targets), interpolated_rotations)
+            self.gripper_targets[:] = start_grippers + fraction * (grippers - start_grippers)
+            for i in range(2):
+                self.data.ctrl[self.arm_aids[i]] = self.ik_q[i]
+                self.data.ctrl[self.gripper_aids[i]] = self.gripper_targets[i]
+            for _ in range(self.frame_skip):
+                mujoco.mj_step(self.model, self.data)
+                current = self._read_contact_forces()
+                forces += current / (self.frame_skip * self.control_steps)
+                self.peak_forces = np.maximum(self.peak_forces, current)
+                self.had_contact |= current > .03
+            mujoco.mj_forward(self.model, self.data)
         self.contact_forces[:] = forces
         self.steps += 1
         self.phase_steps += 1
