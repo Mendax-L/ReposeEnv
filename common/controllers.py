@@ -31,16 +31,17 @@ class SpatialTeleop:
         """
         direction = np.asarray(direction, dtype=np.float32)
         rotation = np.asarray(rotation, dtype=np.float32)
-        if (direction.shape not in ((2,), (3,), (12,)) or not np.isfinite(direction).all()
+        full_shape = (self.environment.action_dim,)
+        if (direction.shape not in ((2,), (3,), full_shape) or not np.isfinite(direction).all()
                 or rotation.shape != (3,) or not np.isfinite(rotation).all()
                 or not np.isfinite(yaw) or arm not in ("inner", "outer", "both")):
             raise ValueError("Control requires finite XYZ/rotation and arm inner, outer or both.")
         native = self.environment.environment
         if native.phase != "control":
             return self.environment.hold_action()
-        if direction.shape == (12,):
+        if direction.shape == full_shape:
             if yaw or np.any(rotation) or gripper is not None:
-                raise ValueError("A full 12-D action cannot be combined with rotation or gripper arguments.")
+                raise ValueError("A full action cannot be combined with rotation or gripper arguments.")
             return np.clip(direction, self.environment.action_low, self.environment.action_high)
         translation = np.zeros(3)
         translation[:len(direction)] = np.clip(direction, -1, 1)
@@ -56,7 +57,7 @@ class SpatialTeleop:
             if opening.shape not in ((), (2,)) or not np.isfinite(opening).all():
                 raise ValueError("gripper must be a finite opening ratio or inner/outer pair")
             values = np.full(2, opening.item()) if opening.shape == () else opening
-            ranges = np.diff(native.gripper_limits, axis=1).ravel()
-            native.gripper_targets[indices] = (native.gripper_limits[indices, 0]
-                                                + np.clip(values[indices], 0, 1) * ranges[indices])
+            for index in indices:
+                side = ("left", "right")[index]
+                action[self.environment.action_groups[f"action.{side}_gripper"]] = np.clip(values[index], 0, 1)
         return np.clip(action.ravel(), self.environment.action_low, self.environment.action_high)

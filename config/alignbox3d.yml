@@ -4,8 +4,10 @@
   "action": [
     "action.left_end_effector_delta_xyz",
     "action.left_end_effector_delta_rpy",
+    "action.left_gripper",
     "action.right_end_effector_delta_xyz",
-    "action.right_end_effector_delta_rpy"
+    "action.right_end_effector_delta_rpy",
+    "action.right_gripper"
   ],
   "observation": {
     "robot_state": [

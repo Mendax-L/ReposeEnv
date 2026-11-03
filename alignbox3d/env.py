@@ -10,11 +10,11 @@ class AlignBox3DEnv(PushEnvironment):
     name = "alignbox3d"
     task_description = "请抓取上箱，抬起并与下箱对齐，然后平稳放下、松开夹爪并撤离。"
     obs_dim = 20
-    action_dim = 12
-    action_low = (-1.0,) * 12
-    action_high = (1.0,) * 12
+    action_dim = 14
+    action_low = ((-1.0,) * 6 + (0.0,)) * 2
+    action_high = (1.0,) * 14
     observation_layout = "left_right_end_effector_pos_rot6d_gripper/v1"
-    action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw/v2"
+    action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v3"
 
     def __init__(self, render_size: int = 512) -> None:
         from .native.env import StackedBoxesEnv
@@ -27,6 +27,8 @@ class AlignBox3DEnv(PushEnvironment):
             for suffix in ("xyz", "rpy")]) for side in ("left", "right")])
         native = self.environment.hold_action().reshape(2, 7)
         native[:, :3] = commands[:, :3]
+        for arm, side in enumerate(("left", "right")):
+            native[arm, 6] = action[self.action_groups[f"action.{side}_gripper"]][0]
         for arm, values in enumerate(commands[:, 3:6]):
             roll, pitch, yaw = values * self.environment.rotation_action_scale
             cx, sx = np.cos(roll), np.sin(roll)
@@ -41,7 +43,7 @@ class AlignBox3DEnv(PushEnvironment):
         return native.ravel()
 
     def native_action_to_interface(self, action: np.ndarray) -> np.ndarray:
-        """Convert an internal 14-D expert command to the public 12-D action."""
+        """Convert world-rotvec expert commands to named XYZ/RPY/gripper actions."""
         commands = np.asarray(action, dtype=float).reshape(2, 7)
         public = np.zeros((2, 6), dtype=np.float32)
         public[:, :3] = commands[:, :3]
@@ -57,15 +59,22 @@ class AlignBox3DEnv(PushEnvironment):
         fields = {f"action.{side}_end_effector_delta_{suffix}": public[arm, offset:offset + 3]
                   for side, arm in (("left", 0), ("right", 1))
                   for suffix, offset in (("xyz", 0), ("rpy", 3))}
-        return np.clip(np.concatenate([fields[key] for key in self._interface_config["action"]]), -1., 1.)
+        fields.update({f"action.{side}_gripper": commands[arm, 6:7]
+                       for arm, side in enumerate(("left", "right"))})
+        return np.clip(np.concatenate([fields[key] for key in self._interface_config["action"]]),
+                       self.action_low, self.action_high).astype(np.float32)
 
     def get_end_effector_poses(self) -> np.ndarray:
         """Measured inner/outer XYZ + WXYZ in the shared world frame, shape (2,7)."""
         return self.environment.tip_poses.astype(np.float32)
 
     def hold_action(self) -> np.ndarray:
-        """Return zero end-effector increments; grippers are not policy actions."""
-        return np.zeros(self.action_dim, dtype=np.float32)
+        """Keep both target poses and absolute gripper targets unchanged."""
+        action = np.zeros(self.action_dim, dtype=np.float32)
+        native = self.environment.hold_action().reshape(2, 7)
+        for arm, side in enumerate(("left", "right")):
+            action[self.action_groups[f"action.{side}_gripper"]] = native[arm, 6]
+        return action
 
     def reset(self, seed: int, *, options: dict[str, Any] | None = None) -> np.ndarray:
         """Randomize XY/yaw and initial roll/pitch with optional explicit poses."""

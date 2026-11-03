@@ -45,6 +45,8 @@ class PolicyInterface:
             values = []
             for field in expected:
                 value = np.asarray(action[field], dtype=np.float32)
+                if features[field]["shape"] == [1] and value.ndim == 0:
+                    value = value.reshape(1)
                 if value.shape != tuple(features[field]["shape"]):
                     raise ValueError(f"Action field {field} must have shape {features[field]['shape']}.")
                 values.append(value)

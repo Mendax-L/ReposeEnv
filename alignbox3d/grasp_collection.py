@@ -9,6 +9,12 @@ from .native.model import BOX_SIZE, GRIP_POINTS
 from .stage_labels import EXPERT_STAGES, EXPERT_STAGE_LABEL_IDS, STAGE_LABELS, sample_stage_instructions
 FREE_TOOL_STAGES = frozenset(("approach_above", "approach_rim", "orient_grasp",
                               "withdraw_orient", "withdraw_above", "park"))
+# Require measured stillness for 10 control intervals (1/6 s at 60 Hz).
+# Per-frame thresholds are speed * dt: 25 um and 0.0083 deg at 60 Hz.
+TOOL_STILL_FRAMES = 10
+TOOL_STILL_LINEAR_SPEED_M_S = .0015
+TOOL_STILL_ANGULAR_SPEED_RAD_S = math.radians(.5)
+TOOL_SETTLE_TIMEOUT_S = 2.5
 
 
 @dataclass(frozen=True)
@@ -53,9 +59,9 @@ class GraspConfig:
             raise ValueError("Sampled contacts must stay on the side-wall interior, clear of its edges")
         if max(self.approach_speed_m_s, self.withdraw_speed_m_s, self.contact_speed_m_s,
                self.lift_speed_m_s, self.carry_speed_m_s, self.lower_speed_m_s) > .050:
-            raise ValueError("Cartesian speed must not exceed 50 mm/s at the 50 Hz action rate")
+            raise ValueError("Cartesian speed must not exceed 50 mm/s")
         if max(self.angular_speed_degrees_s, self.free_angular_speed_degrees_s) > 25.:
-            raise ValueError("Angular speed must not exceed 25 degrees/s at the 50 Hz action rate")
+            raise ValueError("Angular speed must not exceed 25 degrees/s")
 
 
 def sample_grasp(seed, config=None):
@@ -170,9 +176,6 @@ class GraspCarryExpert:
         next_target = n.gripper_targets + np.clip(target-n.gripper_targets,
                                                   -c.gripper_speed_m_s*n.dt, c.gripper_speed_m_s*n.dt)
         action[:, 6] = (next_target-n.gripper_limits[:, 0])/ranges
-        # Grippers are expert-side controls; the public inference action contains
-        # only the two end-effector XYZ/RPY deltas declared in alignbox3d.yml.
-        n.gripper_targets[:] = next_target
         transition = self.step_callback(self.environment.native_action_to_interface(action.ravel()))
         self.frames += 1
         self.stage_counts[self.stage] = self.stage_counts.get(self.stage, 0) + 1
@@ -206,13 +209,22 @@ class GraspCarryExpert:
             target_rotations = np.asarray([n._interpolate_rotation(start, end, fraction)
                                            for start, end in zip(start_rotations, rotations)])
             self.tick(target_positions, target_rotations, opening, feedback=feedback)
-        for _ in range(150):
+        still_frames = 0
+        for _ in range(max(TOOL_STILL_FRAMES, math.ceil(TOOL_SETTLE_TIMEOUT_S / n.dt))):
+            previous_positions = n.tip_positions.copy()
+            previous_rotations = n.tip_rotations.copy()
             self.tick(positions, rotations, opening, feedback=feedback)
-            if (np.max(np.linalg.norm(n.tip_positions - positions, axis=1)) < .001
+            actual_positions, actual_rotations = n.tip_positions, n.tip_rotations
+            reached = (np.max(np.linalg.norm(actual_positions - positions, axis=1)) < .001
                     and max(np.linalg.norm(rotation_vector(end @ actual.T))
-                            for end, actual in zip(rotations, n.tip_rotations)) < math.radians(.5)
-                    and np.max(np.linalg.norm(self.previous_linear_velocity, axis=1)) < .0015
-                    and np.max(np.linalg.norm(self.previous_angular_velocity, axis=1)) < math.radians(.5)):
+                            for end, actual in zip(rotations, actual_rotations)) < math.radians(.5))
+            still = (np.max(np.linalg.norm(actual_positions - previous_positions, axis=1))
+                     < TOOL_STILL_LINEAR_SPEED_M_S * n.dt
+                     and max(np.linalg.norm(rotation_vector(actual @ previous.T))
+                             for actual, previous in zip(actual_rotations, previous_rotations))
+                     < TOOL_STILL_ANGULAR_SPEED_RAD_S * n.dt)
+            still_frames = still_frames + 1 if reached and still else 0
+            if still_frames >= TOOL_STILL_FRAMES:
                 return
         raise GraspFailure(f"tool_tracking_timeout:{name}")
 

@@ -53,10 +53,18 @@ def get_environment_schema(name: str, image_shape: Sequence[int] | None = None) 
                         rotation_composition="R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)")
                 else:
                     semantics[key]["coordinate_frame"] = "world"
+            key = f"action.{side}_gripper"
+            available[key] = _vector(["opening"])
+            semantics[key] = {
+                "units": ["normalized_opening"], "low": [0.], "high": [1.],
+                "command_type": "absolute", "closed": 0., "fully_open": 1.,
+                "target_range_metres": [0., .044], "scale_to_si": [.044],
+                "description": "Absolute driven-finger slide target, not an increment or measured pad gap.",
+            }
         camera = "images.camera2"
         camera_shape = [max(2, 2 * round(shape[0] * .3)), shape[1], 3]
         layout = "configured_robot_fields/v2"
-        action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw/v2"
+        action_semantics = "dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v3"
         termination = "Alignment and stable release are evaluated by the native simulator; time/manual limits are truncated."
     else:
         available["robot.agent_pos"] = _vector(["x", "y"])

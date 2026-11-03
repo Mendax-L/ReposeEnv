@@ -59,6 +59,8 @@ python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
 
 夹爪用五次平滑曲线渐进开合，默认 12 mm 行程变化约需 5.6 s，再停稳至少 0.4 s。闭合时箱体异常升起超过 1.5 mm 或峰值速度超过 25 mm/s，该尝试会被拒绝。运动默认不启用额外加速度限制；需要时用 `--acceleration-mm-s2` 指定。其余随机范围和选项见 `python -m alignbox3d.collect --help`。
 
+末端跟踪的停稳判据使用实测末端的帧间位姿变化：连续 10 帧满足实测平移速度 <1.5 mm/s、角速度 <0.5°/s，并且位置误差 <1 mm、朝向误差 <0.5°。60 Hz 下这对应约 0.167 s，每帧位移 <0.025 mm、角变化 <0.0083°；等待上限 2.5 s。常量集中在 `alignbox3d/grasp_collection.py` 的 `TOOL_STILL_*` / `TOOL_SETTLE_TIMEOUT_S`。固定位置偏差不会产生帧间位移，因此不会再将 P 控制器用于补偿静载的指令速度当成实际运动。
+
 ### 视觉随机化
 
 默认 `--visual-mode all`：工业柔和配色、三档箱体结构、物料、相机和光照随机化。三档结构为 `ribbed_level=0` 无筋、`1` 边缘加强筋、`2` 边缘与面板加强筋；箱体尺寸 240×300×120 mm。加强筋和物料只影响外观，保持箱体质量、惯量和碰撞结构一致。
@@ -85,9 +87,9 @@ python -m common.recording --env pusht --actions training_data/pusht_commands.np
 | 环境 | 状态维数 | 动作 | 频率 |
 | --- | ---: | --- | ---: |
 | `pusht` | 2 | 2 维 agent 绝对目标 XY，范围 `[0,512]` | 10 Hz |
-| `alignbox3d` | 20 | 左右末端 XYZ 与局部 roll/pitch/yaw 增量，共 12 维 | 60 Hz |
+| `alignbox3d` | 20 | 左右末端 XYZ、局部 roll/pitch/yaw 增量及夹爪绝对开度，共 14 维 | 60 Hz |
 
-AlignBox3D 动作顺序由 `config/alignbox3d.yml` 定义：左末端 XYZ、左末端 RPY、右末端 XYZ、右末端 RPY。XYZ 使用世界坐标，RPY 使用末端局部坐标，按通用 roll、pitch、yaw 顺序排列；metadata 显式保存该顺序及组合公式 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。每步平移分量缩放 1 mm、旋转分量缩放 0.5°。夹爪只作为观测返回，不属于 Inference action。
+AlignBox3D 动作顺序由 `config/alignbox3d.yml` 定义：左末端 XYZ、左末端 RPY、左夹爪开度、右末端 XYZ、右末端 RPY、右夹爪开度。XYZ 使用世界坐标，RPY 使用末端局部坐标，按通用 roll、pitch、yaw 顺序排列；metadata 显式保存该顺序及组合公式 `R_next = R_previous @ Rz(yaw) @ Ry(pitch) @ Rx(roll)`。XYZ/RPY 分量范围为 `[-1,1]`，每步分别缩放 1 mm、0.5°；这是每轴的目标增量，60 Hz 下单轴目标速度上限为 60 mm/s，三轴满幅约为 104 mm/s，实测末端运动仍取决于 IK 和伺服跟踪。`action.left_gripper`、`action.right_gripper` 是 `[0,1]` 的绝对开度比例，0 全闭、1 全开，映射驱动手指行程 0–44 mm。全零动作会闭合夹爪；保持当前目标位姿与开度请使用 `env.hold_action()`。`robot.*_gripper` 观测仍是实测手指行程，单位 m。
 
 重置后夹爪张开并与箱体分离，最低指尖至少高于旋转后箱体最高点 20 mm；平放时工具参考点 Z=0.362 m，最大初始倾斜时约 0.408 m。环境由动作直接控制末端，不执行隐式抓取或升降。
 
@@ -116,7 +118,7 @@ LeRobot v3.0 = Parquet 数值数据、同步 MP4 视频和字段/轨迹元数据
 
 每批目录包含 `data/`、`videos/`、`meta/info.json`、`meta/stats.json`、`meta/tasks.parquet`、`meta/episodes/`、`meta/pushenv_schema.json` 与 `meta/provenance.json`。`pushenv_schema.json` 保留固定格式名以兼容已有数据；公共观测字段由环境 YAML 决定。自动示范额外保存采集报告、源码快照、视觉字典及语言字典。
 
-逐帧语言阶段固定为：**接近 → 加紧 → 抬起 → 搬运对齐 → 放下 → 松开撤离**。每个阶段提供 4 种完整中文指令，例如“请保持双臂协同，平稳抬起已经夹紧的上箱。”；每条轨迹按 seed 为各阶段选择一句，同一阶段（含内部子阶段）保持不变，且不影响物理随机采样。`language.stage_id` 为 0–5，`language.stage` 为对应的 6 维独热向量；每帧 `task_index` 指向 `meta/tasks.parquet` 中实际使用的完整句子，不能当作阶段 ID。全部候选句与阶段关系保存在 `meta/language.json` 和 schema 中，采集报告记录该轨迹所选句子。未标注时 ID 为 -1、向量全零。这些字段独立于 20 维 robot state 与 12 维动作；15 个内部控制子阶段由 `alignbox3d/stage_labels.py` 统一映射为六个语言阶段。
+逐帧语言阶段固定为：**接近 → 加紧 → 抬起 → 搬运对齐 → 放下 → 松开撤离**。每个阶段提供 4 种完整中文指令，例如“请保持双臂协同，平稳抬起已经夹紧的上箱。”；每条轨迹按 seed 为各阶段选择一句，同一阶段（含内部子阶段）保持不变，且不影响物理随机采样。`language.stage_id` 为 0–5，`language.stage` 为对应的 6 维独热向量；每帧 `task_index` 指向 `meta/tasks.parquet` 中实际使用的完整句子，不能当作阶段 ID。全部候选句与阶段关系保存在 `meta/language.json` 和 schema 中，采集报告记录该轨迹所选句子。未标注时 ID 为 -1、向量全零。这些字段独立于 20 维 robot state 与 14 维动作；15 个内部控制子阶段由 `alignbox3d/stage_labels.py` 统一映射为六个语言阶段。
 
 `collection.*` 保存抓点、扰动、内部阶段和视觉参数，作为采集元数据。数据校验检查阶段 ID、独热向量和任务文本的一致性。`meta/collection.json` 记录所有尝试与拒绝原因；`meta/provenance.json` 记录参数、运行版本和源码指纹。
 
