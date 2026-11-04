@@ -9,7 +9,7 @@ from common.environment import PushEnvironment, StepResult
 from common.schema import SUPPORTED_ENVIRONMENTS
 
 
-def make_environment(name: str, render_size: int | None = None) -> PushEnvironment:
+def make_environment(name: str, render_size: int | None = None, *, split="validation", data_config=None) -> PushEnvironment:
     name = name.lower()
     render_size = (512 if name == "alignbox3d" else 96) if render_size is None else render_size
     if type(render_size) is not int or render_size < 16 or render_size % 2:
@@ -20,7 +20,7 @@ def make_environment(name: str, render_size: int | None = None) -> PushEnvironme
     if name == "alignbox3d":
         # The public/test environment uses the same industrial renderer as collection.
         from alignbox3d.diversity import DiverseAlignBox3DEnv
-        return DiverseAlignBox3DEnv(render_size=render_size)
+        return DiverseAlignBox3DEnv(render_size=render_size, split=split, data_config=data_config)
     raise ValueError(f"Unknown environment {name!r}; choose from {SUPPORTED_ENVIRONMENTS}.")
 
 

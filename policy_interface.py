@@ -21,10 +21,10 @@ MAX_MESSAGE_BYTES = 1_048_576
 class PolicyInterface:
     """Return the named robot_state/env fields selected by the environment YAML."""
 
-    def __init__(self, name="pusht", *, obs="state", render_size=None):
+    def __init__(self, name="pusht", *, obs="state", render_size=None, split="validation", data_config=None):
         if obs not in ("state", "keypoint", "image", "all"):
             raise ValueError("obs must be state, keypoint, image or all.")
-        self.env = make_environment(name, render_size)
+        self.env = make_environment(name, render_size, split=split, data_config=data_config)
         self.obs = obs
 
     def observe(self):
@@ -163,6 +163,7 @@ def run_rollout(
     seed: int,
     max_steps: int,
     health: dict[str, Any],
+    *, split="validation", data_config=None, trace_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run complete episodes; max_steps counts direct end-effector control ticks.
 
@@ -178,7 +179,17 @@ def run_rollout(
     public_image_key = image_key.removeprefix("observation.")
     source_shape = health.get("contract", {}).get("interface_features", {}).get(public_image_key, {}).get("shape")
     render_size = source_shape[1] if source_shape else image_shape[1] if image_shape is not None else 96
-    environment = make_environment(name, render_size=render_size)
+    environment = make_environment(name, render_size=render_size, split=split, data_config=data_config)
+    trace_file = None
+    if trace_path is not None:
+        trace_path = Path(trace_path)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_file = trace_path.open("x", encoding="utf-8")
+
+    def trace(event: dict[str, Any]) -> None:
+        if trace_file is not None:
+            trace_file.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+            trace_file.flush()
     scores: list[float] = []
     lengths: list[int] = []
     successes: list[bool] = []
@@ -213,6 +224,9 @@ def run_rollout(
             if structured:
                 observation = interface_snapshot()
             episode_in_progress = True
+            trace({"event": "episode_start", "seed": episode_seed,
+                   "state": environment.lerobot_observation(include_images=False)["observation.state"].tolist(),
+                   "instruction": environment.instruction})
             history = deque((observation.copy() for _ in range(n_obs_steps)), maxlen=n_obs_steps)
             images = deque(maxlen=n_obs_steps)
             if image_shape is not None and not structured:
@@ -224,6 +238,7 @@ def run_rollout(
             success = False
             success_known = False
             terminated = truncated = False
+            decision = 0
 
             def consume(transition, *, update_inputs=True):
                 nonlocal score, steps, done, success, success_known, terminated, truncated
@@ -247,13 +262,19 @@ def run_rollout(
                         for transition in _finish_transitions(environment, "max_steps"):
                             consume(transition, update_inputs=False)
                     break
+                active_decision = None
                 if spatial and environment.environment.phase != "control":
                     actions = environment.hold_action()[None, :]
                 else:
+                    state_before = environment.lerobot_observation(include_images=False)["observation.state"].tolist()
+                    instruction_before = environment.instruction
                     observation = (_interface_history(history, environment._interface_config)
                                    if structured else np.stack(history).tolist())
                     if image_shape is not None and not structured:
                         observation = {"observation.state": observation, "image": _rgb_history(np.stack(images))}
+                    trace({"event": "prediction_request", "seed": episode_seed, "decision": decision,
+                           "step_before": steps, "state": state_before,
+                           "instruction": instruction_before, "camera_shape": image_shape})
                     send_message(connection, {"op": "predict", "obs": observation})
                     response = receive_message(connection)
                     if not response.get("ok"):
@@ -263,8 +284,23 @@ def run_rollout(
                         raise RuntimeError(f"Invalid policy action shape or values: {actions.shape}.")
                     if np.any(actions < environment.action_low) or np.any(actions > environment.action_high):
                         raise RuntimeError("Policy actions exceed the environment bounds.")
-                for action in actions:
-                    consume(environment.step(action))
+                    active_decision = decision
+                    trace({"event": "prediction", "seed": episode_seed, "decision": active_decision,
+                           "step_before": steps, "state": state_before,
+                           "instruction": instruction_before, "camera_shape": image_shape,
+                           "action_shape": list(actions.shape), "action_chunk": actions.tolist()})
+                    decision += 1
+                for chunk_index, action in enumerate(actions):
+                    transition = environment.step(action)
+                    consume(transition)
+                    trace({"event": "action", "seed": episode_seed,
+                           "decision": active_decision,
+                           "chunk_index": chunk_index, "step": steps,
+                           "action": action.tolist(),
+                           "next_state": environment.lerobot_observation(include_images=False)["observation.state"].tolist(),
+                           "reward": float(transition.reward),
+                           "done": done, "success": success,
+                           "phase": environment.environment.phase if spatial else None})
                     # Stop consuming a model chunk once the episode completes.
                     if done or steps >= max_steps or (spatial and environment.environment.phase != "control"):
                         break
@@ -273,8 +309,12 @@ def run_rollout(
             lengths.append(steps)
             successes.append(success)
             results.append({"seed": episode_seed, "steps": steps, "score": score, "success": success,
+                            "scene": environment.episode_metadata() if hasattr(environment, "episode_metadata") else None,
                             "success_known": success_known, "terminated": terminated,
                             "truncated": truncated or (steps >= max_steps and not terminated)})
+            trace({"event": "episode_end", "seed": episode_seed,
+                   "steps": steps, "score": score, "success": success,
+                   "terminated": terminated, "truncated": truncated or (steps >= max_steps and not terminated)})
     except BaseException:
         if spatial and episode_in_progress:
             try:
@@ -291,6 +331,9 @@ def run_rollout(
         raise
     else:
         environment.close()
+    finally:
+        if trace_file is not None:
+            trace_file.close()
     return {
         "environment": name,
         "episodes": episodes,
@@ -299,6 +342,7 @@ def run_rollout(
         "obs_shape": [environment.obs_dim],
         "action_shape": [environment.action_dim],
         "environment_contract": environment.contract(),
+        "data_split": {"split": getattr(environment, "split", None), "config": getattr(environment, "data_config", None)},
         "mean_score": float(np.mean(scores)),
         "success_rate": float(np.mean(successes)),
         "scores": scores,
@@ -333,6 +377,8 @@ def validate_policy_contract(environment: PushEnvironment, health: dict[str, Any
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", choices=SUPPORTED_ENVIRONMENTS, default="pusht")
+    parser.add_argument("--split", choices=("train", "validation"), default="validation")
+    parser.add_argument("--data-config", type=Path, help="AlignBox3D collection/evaluation config (JSON syntax in a legacy .yml file).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--episodes", type=int, default=1)
@@ -341,6 +387,7 @@ def main():
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--socket-timeout", type=float, default=120.0)
     parser.add_argument("--output", type=Path, default=Path("outputs/policy/metrics.json"))
+    parser.add_argument("--trace", type=Path, help="Write flushed JSONL prediction/action trace for debugging.")
     parser.add_argument("--export-contract", type=Path, help="Export feature and action contracts without a policy connection.")
     parser.add_argument("--obs", choices=("state", "keypoint", "image", "all"),
                         help="Contract input mode, or an expected TCP input mode (otherwise negotiated with the model).")
@@ -350,7 +397,7 @@ def main():
     if not np.isfinite(args.socket_timeout) or args.socket_timeout <= 0:
         parser.error("socket-timeout must be positive and finite")
     if args.export_contract:
-        with PolicyInterface(args.env, obs=args.obs or "state") as interface:
+        with PolicyInterface(args.env, obs=args.obs or "state", split=args.split, data_config=args.data_config) as interface:
             args.export_contract.parent.mkdir(parents=True, exist_ok=True)
             args.export_contract.write_text(json.dumps(interface.contract(), indent=2) + "\n", encoding="utf-8")
         print(f"Contract: {args.export_contract.resolve()}")
@@ -368,7 +415,8 @@ def main():
             negotiated_mode = "image" if health.get("image_shape") is not None else "state"
             if args.obs is not None and args.obs != negotiated_mode:
                 raise RuntimeError(f"Requested {args.obs} input, but the model requires {negotiated_mode}.")
-            report = run_rollout(connection, args.env, args.episodes, args.seed, args.max_steps, health)
+            report = run_rollout(connection, args.env, args.episodes, args.seed, args.max_steps, health,
+                                 split=args.split, data_config=args.data_config, trace_path=args.trace)
         finally:
             try:
                 send_message(connection, {"op": "close"})

@@ -5,14 +5,14 @@ from dataclasses import asdict
 
 from .diversity import (
     BOX_FORMS, BOX_PALETTE, COLOR_STYLE, CONTENT_AMOUNTS, CONTENT_PALETTES,
-    CONTENT_TYPES, FEATURES, HELDOUT_VISUAL_CONFIGS, HOLDOUT_SIGNATURE_FIELDS,
+    CONTENT_TYPES, FEATURES, HELDOUT_RULES, HELDOUT_VISUAL_CONFIGS, HOLDOUT_SIGNATURE_FIELDS,
     RENDER_STYLE, RIBBED_LEVELS, TABLE_PALETTE, VISUAL_MODES,
 )
 
 
-def metadata_dictionary(config):
+def metadata_dictionary(config, data_config=None):
     return {
-        "version": 5, "config": asdict(config), "render_style": RENDER_STYLE,
+        "version": 6, "config": asdict(config), "render_style": RENDER_STYLE,
         "color_style_id": {0: "original", 1: COLOR_STYLE},
         "box_color_id": {index: {"name": name, "base_rgb": list(rgb)} for index, (name, rgb) in enumerate(BOX_PALETTE)},
         "table_color_id": {index: {"name": name, "base_rgb": list(rgb)} for index, (name, rgb) in enumerate(TABLE_PALETTE)},
@@ -33,8 +33,11 @@ def metadata_dictionary(config):
         "camera": "Only camera2/closeup changes. Position deltas in world XYZ; rotation delta is local X then Y then Z quaternion composition. Both deltas are sampled once per episode. FOV unchanged.",
         "geometry": "Nominal dimensions 240x300x120 mm. Original collision shell, inertia and gripper geometry unchanged. Ribs and contents are visual-only and collision-disabled.",
         "heldout_signature_fields": list(HOLDOUT_SIGNATURE_FIELDS),
-        "heldout_visual_configs": list(HELDOUT_VISUAL_CONFIGS),
-        "heldout_policy": "Collectors reject every reserved discrete signature; these configurations are evaluation-only.",
+        "heldout_rules": (data_config["splits"]["validation"]["holdout_rules"]
+                          if data_config is not None else list(HELDOUT_RULES)),
+        "heldout_visual_configs": (data_config["splits"]["validation"]["visuals"]
+                                   if data_config is not None else list(HELDOUT_VISUAL_CONFIGS)),
+        "heldout_policy": "Training excludes any matching rule. Attributes within a rule are ANDed; rules are ORed; omitted attributes are unrestricted. Validation examples and model demos must match a rule.",
         "expert_labels": "Only successful contact-grasp demonstrations are saved; per-frame stage instructions are defined in meta/language.json.",
         "policy_inputs": "collection.* are experimental metadata, excluded from observation.state and action; existing image/state models ignore them.",
     }

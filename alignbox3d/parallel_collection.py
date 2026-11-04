@@ -10,7 +10,7 @@ from time import perf_counter
 import numpy as np
 
 from common.lerobot import LeRobotWriter
-from .diversity import DiverseAlignBox3DEnv, is_heldout_configuration
+from .diversity import DiverseAlignBox3DEnv
 from .grasp_collection import GraspConfig, collect_grasp_episode
 from .stage_labels import STAGE_INSTRUCTIONS
 
@@ -18,9 +18,9 @@ from .stage_labels import STAGE_INSTRUCTIONS
 _worker_environment = None
 
 
-def initialize_worker(render_size):
+def initialize_worker(render_size, split, data_config):
     global _worker_environment
-    _worker_environment = DiverseAlignBox3DEnv(render_size=render_size)
+    _worker_environment = DiverseAlignBox3DEnv(render_size=render_size, split=split, data_config=data_config)
 
 
 def run_attempt(environment, writer, seed, attempt, settings, config):
@@ -31,12 +31,8 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
         "roll": float(tilt[0]), "pitch": float(tilt[1]), "visual_mode": settings["visual_mode"]})
     initial = environment.environment.data.qpos[
         environment.environment.box_qadr:environment.environment.box_qadr+7].copy().tolist()
-    if is_heldout_configuration(environment.visual_metadata):
-        result = {"seed": seed, "saved": False, "success": False,
-                  "failure_reason": "heldout_visual_signature", "frames": 0}
-    else:
-        result = collect_grasp_episode(environment, writer, seed, config=config,
-                                       max_steps=settings["max_steps"])
+    result = collect_grasp_episode(environment, writer, seed, config=config,
+                                   max_steps=settings["max_steps"])
     result.update(attempt=attempt, initial_box_pose_world=initial,
                   initial_roll_pitch_rad=tilt.tolist(), visual_parameters=environment.episode_metadata(),
                   worker_pid=os.getpid(), attempt_seconds=perf_counter()-started)
@@ -90,7 +86,7 @@ def collection_attempts(environment, writer, args, config):
             raise RuntimeError("Worker scratch directory escaped the destination dataset.")
         executor = ProcessPoolExecutor(max_workers=args.workers,
             mp_context=multiprocessing.get_context("spawn"), initializer=initialize_worker,
-            initargs=(args.render_size,))
+            initargs=(args.render_size, args.split, args.data_config))
         pending = {}
         def parallel():
             submitted = saved = 0

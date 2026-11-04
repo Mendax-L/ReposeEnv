@@ -1,0 +1,42 @@
+{
+  "visual_randomization": {
+    "camera_position_jitter_m": 0.01,
+    "camera_rotation_jitter_deg": 1.0,
+    "light_min": 0.8,
+    "light_max": 1.2
+  },
+  "splits": {
+    "train": {"seed_range": [500000, 900000]},
+    "validation": {
+      "seed_range": [900000, 1000000],
+      "holdout_rules": [
+        {"name": "plain_graphite", "ribbed_level": 0, "upper_color_id": 0},
+        {"name": "edge_dusty_blue", "ribbed_level": 1, "upper_color_id": 6},
+        {"name": "face_olive_gray", "ribbed_level": 2, "upper_color_id": 3},
+        {"name": "plain_warm_gray", "ribbed_level": 0, "upper_color_id": 5},
+        {"name": "edge_off_white", "ribbed_level": 1, "upper_color_id": 7},
+        {"name": "face_sand_beige", "ribbed_level": 2, "upper_color_id": 4}
+      ],
+      "visuals": [
+        {"name": "plain_white_cylinders", "visual_seed": 900001, "ribbed_level": 0,
+         "upper_color_id": 0, "lower_color_id": 7, "table_color_id": 1,
+         "content_type_id": 2, "content_amount_id": 2, "content_palette_id": 2},
+        {"name": "edge_blue_cartons", "visual_seed": 900002, "ribbed_level": 1,
+         "upper_color_id": 6, "lower_color_id": 4, "table_color_id": 3,
+         "content_type_id": 1, "content_amount_id": 1, "content_palette_id": 0},
+        {"name": "face_olive_mixed", "visual_seed": 900003, "ribbed_level": 2,
+         "upper_color_id": 3, "lower_color_id": 2, "table_color_id": 2,
+         "content_type_id": 3, "content_amount_id": 2, "content_palette_id": 1},
+        {"name": "plain_warm_mixed", "visual_seed": 900004, "ribbed_level": 0,
+         "upper_color_id": 5, "lower_color_id": 2, "table_color_id": 0,
+         "content_type_id": 3, "content_amount_id": 1, "content_palette_id": 2},
+        {"name": "edge_graphite_cylinders", "visual_seed": 900005, "ribbed_level": 1,
+         "upper_color_id": 7, "lower_color_id": 0, "table_color_id": 2,
+         "content_type_id": 2, "content_amount_id": 1, "content_palette_id": 1},
+        {"name": "face_beige_none", "visual_seed": 900006, "ribbed_level": 2,
+         "upper_color_id": 4, "lower_color_id": 1, "table_color_id": 1,
+         "content_type_id": 0, "content_amount_id": 0, "content_palette_id": 0}
+      ]
+    }
+  }
+}

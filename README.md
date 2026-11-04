@@ -18,6 +18,7 @@ ReposeEnv/
 ├── environment.yml           # 仿真环境依赖
 ├── environment.py            # 统一环境工厂
 ├── policy_interface.py       # 策略接口、契约导出与 TCP 客户端
+├── config/                   # 接口、频率与共用的训练/验证场景 YAML
 ├── common/                   # 共享环境、遥操作、录制和 LeRobot 读写
 │   └── recording.py          # 人工采集、动作回放、数据校验入口
 ├── alignbox3d/               # 双臂箱体对齐任务
@@ -31,7 +32,7 @@ ReposeEnv/
 └── training_data/            # 本地训练数据，不进入 Git
 ```
 
-功能代码按任务归属放置，参数在代码中给出默认值并支持命令行覆盖。测试、静态预览工具及其生成资料由开发时在仓库外维护。机器人 XML、OBJ 网格、来源和许可证位于 `alignbox3d/native/assets/arx_l5/`，运行时必须保留；训练数据及运行输出加入 `.gitignore`。
+功能代码按任务归属放置，接口、频率和训练/验证场景在 `config/` 中声明，其余采集参数支持命令行覆盖。测试、静态预览工具及其生成资料由开发时在仓库外维护。机器人 XML、OBJ 网格、来源和许可证位于 `alignbox3d/native/assets/arx_l5/`，运行时必须保留；训练数据及运行输出加入 `.gitignore`。
 
 ## 自动采集
 
@@ -39,7 +40,16 @@ ReposeEnv/
 python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
 ```
 
-流程为：接近 → 渐进加紧 → 抬起 → 搬运对齐 → 放下 → 渐进松开并撤离 → 稳定验收。每步控制两个末端和夹爪，箱体通过真实碰撞接触运动。只保存成功示范，默认输出到 `training_data/lerobot/alignbox3d/grasp-carry-日期时间/`；`--output` 可以指定一个尚不存在的目录。
+流程为：接近 → 渐进加紧 → 抬起 → 搬运对齐 → 放下 → 渐进松开并撤离 → 稳定验收。每步控制两个末端和夹爪，箱体通过真实碰撞接触运动。只保存成功示范，默认输出到 `training_data/lerobot/alignbox3d/grasp-carry-train-日期时间/`；`--output` 可以指定一个尚不存在的目录。
+
+训练集和验证集共用 `config/alignbox3d_data.yml`，分别生成独立的 LeRobot 目录：
+
+```powershell
+python -m alignbox3d.collect --split train --episodes 100 --workers 4 --output training_data/lerobot/alignbox3d/train
+python -m alignbox3d.collect --split validation --episodes 12 --workers 4 --output training_data/lerobot/alignbox3d/validation
+```
+
+`--data-config` 可指定另一份同结构配置。当前 `.yml` 文件内容必须使用 **JSON 语法**，由 Python 标准库 `json` 解析；后缀是历史命名，不能直接写成普通 YAML 缩进语法。采集前可运行 `python -m json.tool config/alignbox3d_data.yml > /dev/null` 检查语法。文件声明相机/光照随机范围、两侧的 `[start, stop)` seed 范围以及验证专用搭配规则。默认训练范围 `[500000,900000)`、验证范围 `[900000,1000000)`；采集器拒绝越界种子，工作进程使用同一配置。训练侧排除所有匹配 `holdout_rules` 的搭配，验证侧按 `visuals` 样例顺序轮换。配置和实际 split 保存到 `meta/data_split.json`、schema 和采集报告中。ActionExpert 的 `data.dataset` 指向训练目录，`data.validation_dataset` 指向验证目录后，直接使用该划分。
 
 `--workers` 默认 1，设为 4 即启动四个独立仿真进程。主进程按 seed 顺序合并成功轨迹，重新生成全局编号和统计，视频直接复制。`--episodes` 指成功条数；失败只记录到 `meta/collection.json`。达到 `--max-attempts` 仍不足目标时保留已成功的数据并报错；默认最多尝试成功目标条数的五倍。
 
@@ -47,7 +57,7 @@ python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
 
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `--seed` | 500000 | 首次尝试的随机种子，后续依次递增 |
+| `--seed` | 当前 split 的起点 | 首次尝试的随机种子，后续依次递增 |
 | `--render-size` | 256 | 两相机录制宽度 |
 | `--max-steps` | 3000 | 单次尝试的动作步数上限，默认按 YAML 的采样频率保留 100 s |
 | `--approach-speed-mm-s` / `--withdraw-speed-mm-s` | 50 | 空载接近、撤离速度上限 |
@@ -65,7 +75,15 @@ python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
 
 默认 `--visual-mode all`：工业柔和配色、三档箱体结构、物料、相机和光照随机化。三档结构为 `ribbed_level=0` 无筋、`1` 边缘加强筋、`2` 边缘与面板加强筋；箱体尺寸 240×300×120 mm。加强筋和物料只影响外观，保持箱体质量、惯量和碰撞结构一致。
 
-相机位置各轴 ±10 mm、旋转各轴 ±1°，灯光强度系数 0.8–1.2。可选模式为 `baseline/color/ribbing/contents/camera/lighting/all`。六个评估专用组合集中定义在 `alignbox3d/diversity.py` 的 `HELDOUT_VISUAL_CONFIGS` 中，采集器拒绝将这些组合写入训练集。
+相机位置各轴默认 ±10 mm、旋转各轴 ±1°，灯光强度系数 0.8–1.2，均由共用数据配置设置。训练可选模式为 `baseline/color/ribbing/contents/camera/lighting/all`；验证固定使用 `all`。搭配划分集中定义在 `config/alignbox3d_data.yml` 的 `splits.validation.holdout_rules` 中，例如以下 JSON 片段：
+
+```json
+{"holdout_rules": [{"name": "edge_dusty_blue", "ribbed_level": 1, "upper_color_id": 6}]}
+```
+
+这条规则保留“边缘加强筋＋灰蓝色上箱”，不论下箱颜色、桌面、物料类型、数量或配色如何变化，训练都排除这个搭配。单条规则内的字段同时匹配，多条规则任一匹配即保留；未列出的字段不参与判断。规则支持 `ribbed_level`、`upper_color_id`、`lower_color_id`、`table_color_id`、`content_type_id`、`content_amount_id`、`content_palette_id` 的任意非空子集。`visuals` 是具体验证/演示样例，必须匹配至少一条规则。
+
+公共 `make_environment("alignbox3d")` 默认使用验证场景，可传入 `split="train"` 或 `data_config=...`。小 seed（如 0）会映射到所选范围内；直接传入范围内 seed 则保持原值。单独的颜色或箱体结构仍可在训练中出现，指定的属性搭配仅用于验证。旧数据不会自动过滤，规则变更后应重新生成训练/验证集。
 
 ## 人工采集、回放与校验
 
@@ -137,4 +155,15 @@ python policy_interface.py --env alignbox3d --host 127.0.0.1 --port 8765 --episo
 
 模型侧在 ActionExpert 环境运行；仿真侧在 ReposeEnv 环境运行。TCP = 本机或网络进程之间的通信连接，策略启动时核对维数、字段顺序、单位和动作语义。
 
+排查在线推理时，可给 `policy_interface.py` 增加 `--trace 路径.jsonl`。它逐行刷新 `episode_start`、`prediction_request`、`prediction`、`action`、`episode_end` 事件：请求行含动作前 20 维状态和指令，预测行含 `[n,14]` 动作块，动作行含实际执行的 14 维动作、下一状态、奖励、成功标志及阶段。模型报错时，最后一条 `prediction_request` 也会保留。
+
 在线 `predict.obs` 保留 `robot_state` 和 `env` 的命名字段；图像用 RGB uint8 HWC 的 shape/base64 编码，指令使用自然语言字符串（历史窗口使用字符串列表）。ActionExpert 按 checkpoint 中保存的 YAML 顺序拼接 `robot_state`，与训练的 `observation.state` 完全一致。数据落盘时相机才使用 LeRobot 的 `observation.images.camera2` / `observation.images.front`，语言通过逐帧 `task_index` 关联 `meta/tasks.parquet`。观测、图像和语言都是动作前同一时刻的数据。字段顺序、旋转语义或 FPS 改变后需重新采集和训练，旧 checkpoint 不会自动转换。
+
+训练模型的演示入口位于相邻 ActionExpert 仓库的 `demo.py`。在 ActionExpert 环境执行，它会启动模型服务，并用 ReposeEnv 解释器打开验证场景，默认显示总览与近景：
+
+```powershell
+Set-Location Z:\ActionExpert
+python demo.py outputs/alignbox3d/qwen_vlm_run01/best.pt --episodes 6 --record-video
+```
+
+默认通过 `conda run -n ReposeEnv python` 启动仿真，也可用 `--reposeenv-python E:\anaconda3\envs\ReposeEnv\python.exe` 显式指定解释器。`--data-config` 与采集使用同一 YAML；`--no-show` 关闭窗口，`--dry-run` 只打印启动命令。报告和录像放在 checkpoint 所在训练目录的 `inference/` 下。

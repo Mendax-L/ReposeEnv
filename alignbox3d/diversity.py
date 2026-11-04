@@ -9,7 +9,9 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict, dataclass
 import itertools
+import json
 import math
+from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import mujoco
@@ -64,28 +66,7 @@ CONTENT_PALETTES = (
     ("cool_industrial", ((.25, .31, .34, 1.), (.43, .54, .60, 1.), (.67, .70, .68, 1.))),
     ("safety", ((.34, .36, .36, 1.), (.82, .43, .13, 1.), (.68, .68, .62, 1.))),
 )
-# Exact discrete combinations reserved for evaluation. Continuous camera and
-# light values are derived from visual_seed; collectors reject these signatures.
-HELDOUT_VISUAL_CONFIGS = (
-    {"name": "plain_white_cylinders", "visual_seed": 900001, "ribbed_level": 0,
-     "upper_color_id": 0, "lower_color_id": 7, "table_color_id": 1,
-     "content_type_id": 2, "content_amount_id": 2, "content_palette_id": 2},
-    {"name": "edge_blue_cartons", "visual_seed": 900002, "ribbed_level": 1,
-     "upper_color_id": 6, "lower_color_id": 4, "table_color_id": 3,
-     "content_type_id": 1, "content_amount_id": 1, "content_palette_id": 0},
-    {"name": "face_olive_mixed", "visual_seed": 900003, "ribbed_level": 2,
-     "upper_color_id": 3, "lower_color_id": 2, "table_color_id": 2,
-     "content_type_id": 3, "content_amount_id": 2, "content_palette_id": 1},
-    {"name": "plain_warm_mixed", "visual_seed": 900004, "ribbed_level": 0,
-     "upper_color_id": 5, "lower_color_id": 2, "table_color_id": 0,
-     "content_type_id": 3, "content_amount_id": 1, "content_palette_id": 2},
-    {"name": "edge_graphite_cylinders", "visual_seed": 900005, "ribbed_level": 1,
-     "upper_color_id": 7, "lower_color_id": 0, "table_color_id": 2,
-     "content_type_id": 2, "content_amount_id": 1, "content_palette_id": 1},
-    {"name": "face_beige_none", "visual_seed": 900006, "ribbed_level": 2,
-     "upper_color_id": 4, "lower_color_id": 1, "table_color_id": 1,
-     "content_type_id": 0, "content_amount_id": 0, "content_palette_id": 0},
-)
+DEFAULT_DATA_CONFIG = Path(__file__).resolve().parents[1] / "config/alignbox3d_data.yml"
 HOLDOUT_SIGNATURE_FIELDS = ("ribbed_level", "upper_color_id", "lower_color_id", "table_color_id",
                             "content_type_id", "content_amount_id", "content_palette_id")
 FEATURES = {
@@ -273,15 +254,86 @@ def industrial_colors(rng, color_ids=None):
 
 
 def visual_signature(metadata):
-    """Return the discrete fields used to keep evaluation visuals out of training."""
+    """Describe a complete visual example independently of partial holdout rules."""
     return tuple(int(metadata[field]) for field in HOLDOUT_SIGNATURE_FIELDS)
 
 
-_HELDOUT_SIGNATURES = frozenset(visual_signature(row) for row in HELDOUT_VISUAL_CONFIGS)
+def _matches_visual_rule(metadata, rule):
+    return all(metadata.get(field) == value for field, value in rule.items() if field != "name")
 
 
-def is_heldout_configuration(metadata):
-    return visual_signature(metadata) in _HELDOUT_SIGNATURES
+def load_data_config(path=None):
+    """Read JSON-formatted split rules from the historical .yml path."""
+    config_path = Path(path or DEFAULT_DATA_CONFIG)
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{config_path}: configuration must use JSON syntax, even with a .yml suffix.") from error
+    VisualConfig(**config["visual_randomization"])
+    splits = config["splits"]
+    if set(splits) != {"train", "validation"}:
+        raise ValueError("Data config must declare train and validation splits.")
+    ranges = [splits[name]["seed_range"] for name in ("train", "validation")]
+    for interval in ranges:
+        if (not isinstance(interval, list) or len(interval) != 2
+                or any(type(value) is not int for value in interval)
+                or not 0 <= interval[0] < interval[1] <= 2**63):
+            raise ValueError("Each seed_range must be an int64 [start, stop) interval.")
+    if max(interval[0] for interval in ranges) < min(interval[1] for interval in ranges):
+        raise ValueError("Training and validation seed ranges overlap.")
+    visuals = splits["validation"]["visuals"]
+    if not isinstance(visuals, list) or not visuals:
+        raise ValueError("Validation needs at least one reserved visual combination.")
+    limits = (3, len(BOX_PALETTE), len(BOX_PALETTE), len(TABLE_PALETTE),
+              len(CONTENT_TYPES), len(CONTENT_AMOUNTS), len(CONTENT_PALETTES))
+    rules = splits["validation"].get("holdout_rules")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("Validation needs nonempty holdout_rules declaring the reserved attribute combinations.")
+    rule_names, rule_signatures = set(), set()
+    for rule in rules:
+        if (not isinstance(rule, dict) or not isinstance(rule.get("name"), str)
+                or not rule["name"] or rule["name"] in rule_names):
+            raise ValueError("Each holdout rule needs a unique, nonempty name.")
+        fields = set(rule)-{"name"}
+        if not fields or fields-set(HOLDOUT_SIGNATURE_FIELDS):
+            raise ValueError("Holdout rules must specify at least one supported visual attribute.")
+        if any(type(rule[field]) is not int or not 0 <= rule[field] < limit
+               for field, limit in zip(HOLDOUT_SIGNATURE_FIELDS, limits) if field in fields):
+            raise ValueError("Holdout rule IDs are outside their palettes.")
+        signature = tuple(sorted((field, rule[field]) for field in fields))
+        if signature in rule_signatures:
+            raise ValueError("Holdout rules must not repeat an attribute combination.")
+        rule_names.add(rule["name"])
+        rule_signatures.add(signature)
+    signatures, names = set(), set()
+    for row in visuals:
+        if (not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"] or row["name"] in names
+                or type(row.get("visual_seed")) is not int
+                or not ranges[1][0] <= row["visual_seed"] < ranges[1][1]):
+            raise ValueError("Validation visuals need unique names and visual_seed values inside the validation range.")
+        if any(type(row.get(field)) is not int or not 0 <= row[field] < limit
+               for field, limit in zip(HOLDOUT_SIGNATURE_FIELDS, limits)):
+            raise ValueError("Validation visual IDs are outside their palettes.")
+        if (row["content_type_id"] == 0) != (row["content_amount_id"] == 0):
+            raise ValueError("Only empty containers may have content_amount_id=0.")
+        signature = visual_signature(row)
+        if signature in signatures:
+            raise ValueError("Validation visual combinations must be unique.")
+        if not any(_matches_visual_rule(row, rule) for rule in rules):
+            raise ValueError("Every validation visual must match at least one holdout rule.")
+        signatures.add(signature)
+        names.add(row["name"])
+    return config
+
+
+_default_validation = load_data_config()["splits"]["validation"]
+HELDOUT_VISUAL_CONFIGS = tuple(_default_validation["visuals"])
+HELDOUT_RULES = tuple(_default_validation["holdout_rules"])
+
+
+def is_heldout_configuration(metadata, config=None):
+    rules = config["splits"]["validation"]["holdout_rules"] if config is not None else HELDOUT_RULES
+    return any(_matches_visual_rule(metadata, rule) for rule in rules)
 
 
 def _delta_quat(rpy):
@@ -326,8 +378,12 @@ def camera_contains_boxes(native, margin=.025):
 class DiverseAlignBox3DEnv(AlignBox3DEnv):
     """Opt-in adapter retaining the old state/action and recording contracts."""
 
-    def __init__(self, render_size=512, visual_config=None):
-        self.visual_config = visual_config or VisualConfig()
+    def __init__(self, render_size=512, visual_config=None, *, split=None, data_config=None):
+        self.data_config = load_data_config(data_config)
+        if split not in (None, "train", "validation"):
+            raise ValueError("split must be train or validation.")
+        self.split = split
+        self.visual_config = visual_config or VisualConfig(**self.data_config["visual_randomization"])
         PushEnvironment.__init__(self, StackedBoxesEnv(render_size=render_size, scene_xml=visual_scene()))
         model = self.environment.model
         self._base = {key: getattr(model, key).copy() for key in
@@ -348,7 +404,23 @@ class DiverseAlignBox3DEnv(AlignBox3DEnv):
 
     def reset(self, seed, *, options=None):
         options = dict(options or {})
+        self.visual_case = None
+        if self.split is not None:
+            start, stop = self.data_config["splits"][self.split]["seed_range"]
+            # Gym-style small seeds select reproducible cases within this split.
+            seed = int(seed)
+            seed = seed if start <= seed < stop else start + seed % (stop-start)
+        if self.split == "validation":
+            visuals = self.data_config["splits"]["validation"]["visuals"]
+            row = visuals[(seed-start) % len(visuals)]
+            self.visual_case = row["name"]
+            options.update(visual_mode="all", visual_seed=row["visual_seed"],
+                           ribbed_level=row["ribbed_level"], content_type=CONTENT_TYPES[row["content_type_id"]],
+                           content_amount=row["content_amount_id"], content_palette_id=row["content_palette_id"],
+                           color_ids=[row[field] for field in ("upper_color_id", "lower_color_id", "table_color_id")])
         visual_seed = int(options.pop("visual_seed", seed))
+        if self.split == "train" and not start <= visual_seed < stop:
+            raise ValueError("Training visual_seed must lie in the configured training range.")
         mode = options.pop("visual_mode", "all")
         if mode == "form":
             mode = "ribbing"
@@ -389,6 +461,16 @@ class DiverseAlignBox3DEnv(AlignBox3DEnv):
         observation = super().reset(seed, options=options)
         self._apply_visuals(visual_seed, mode, ribbed_level, content_type, content_amount,
                             color_ids, content_palette_id)
+        if self.split == "train":
+            for retry in range(1024):
+                if not is_heldout_configuration(self.visual_metadata, self.data_config):
+                    break
+                if any(value is not None for value in (ribbed_level, content_type, content_amount, color_ids, content_palette_id)):
+                    raise ValueError("Explicit training visuals match a reserved validation combination.")
+                candidate_seed = start + (visual_seed-start+retry+1) % (stop-start)
+                self._apply_visuals(candidate_seed, mode, None, None, None, None, None)
+            else:
+                raise RuntimeError("Cannot sample a training visual outside the validation set.")
         self.collection_metadata = {
             "expert_stage_id": -1,
             "grasp_points_box_m": [[0., 0., 0.], [0., 0., 0.]],
@@ -515,6 +597,7 @@ class DiverseAlignBox3DEnv(AlignBox3DEnv):
             "physics": "Original five collision geoms, mass, grip points and outer box dimensions retained.",
             "structures": "Edge and face ribs plus box contents are zero-mass, collision-disabled visuals.",
         }
+        schema["data_split"] = {"split": self.split, "config": copy.deepcopy(self.data_config)}
         for key in ("expert_stage_id", "grasp_points_box_m", "grasp_angle_vectors_box_rad"):
             schema["feature_semantics"][f"collection.{key}"]["description"] = (
                 "Grasp expert metadata, excluded from policy inputs: internal stage ID or sampled box-local contact points/rotation vectors. Stage may change each frame; -1 means no grasp expert is running.")
@@ -535,6 +618,7 @@ class DiverseAlignBox3DEnv(AlignBox3DEnv):
     def episode_metadata(self):
         metadata = copy.deepcopy({**self.visual_metadata, **self.collection_metadata})
         metadata.update(visual_mode=VISUAL_MODES[metadata["visual_mode_id"]],
+                        split=self.split, visual_case=self.visual_case,
                         box_form=BOX_FORMS[metadata["box_form_id"]],
                         content_type=CONTENT_TYPES[metadata["content_type_id"]],
                         content_amount=CONTENT_AMOUNTS[metadata["content_amount_id"]],
