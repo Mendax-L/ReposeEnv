@@ -1,10 +1,10 @@
-"""Six stable stage IDs with sentence-level grasp instructions."""
+"""Stable stage IDs with sentence-level grasp and contact-recovery instructions."""
 from __future__ import annotations
 
 import numpy as np
 
 
-STAGE_LABELS = ("接近", "加紧", "抬起", "搬运对齐", "放下", "松开撤离")
+STAGE_LABELS = ("接近", "加紧", "抬起", "搬运对齐", "放下", "松开撤离", "重新抓取")
 STAGE_INSTRUCTIONS = (
     (
         "请让双臂夹爪接近上箱两侧的抓取位置，并调整好抓取姿态。",
@@ -42,17 +42,23 @@ STAGE_INSTRUCTIONS = (
         "请逐步解除对上箱的夹持并撤回双臂，等待上下箱稳定叠放。",
         "请打开双侧夹爪并移开双臂，让上箱保持在下箱上稳定放置。",
     ),
+    (
+        "请松开抵住箱体的夹爪，退出箱沿后重新对准两侧抓点。",
+        "请先解除错误的单侧接触，退开夹爪，再重新抓取上箱。",
+        "请让抵住箱子的夹爪松开并撤离，确认位置后重新夹取。",
+        "请从错误接触中退出，调整双臂姿态并重新对准上箱。",
+    ),
 )
 EXPERT_STAGES = (
     "initial_settle", "approach_above", "approach_rim", "orient_grasp",
     "descend_to_grasp", "close_grippers", "lift", "carry_align", "lower",
     "release", "withdraw_rim", "withdraw_orient", "withdraw_above", "park",
-    "verify_released_alignment",
+    "verify_released_alignment", "recover_contact",
 )
-EXPERT_STAGE_LABEL_IDS = (0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5)
+EXPERT_STAGE_LABEL_IDS = (0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 6)
 LANGUAGE_FEATURES = {
     "language.stage_id": {"dtype": "int64", "shape": [1], "names": ["stage_id"]},
-    "language.stage": {"dtype": "float32", "shape": [6], "names": list(STAGE_LABELS)},
+    "language.stage": {"dtype": "float32", "shape": [len(STAGE_LABELS)], "names": list(STAGE_LABELS)},
 }
 
 
@@ -65,7 +71,7 @@ def sample_stage_instructions(seed):
 def stage_observation(stage_id):
     """Unlabelled recordings use -1 and a zero vector, never a fabricated label."""
     if type(stage_id) is not int or not -1 <= stage_id < len(STAGE_LABELS):
-        raise ValueError("stage_id must be -1 or one of 0..5")
+        raise ValueError(f"stage_id must be -1 or one of 0..{len(STAGE_LABELS)-1}")
     one_hot = np.zeros(len(STAGE_LABELS), dtype=np.float32)
     if stage_id >= 0:
         one_hot[stage_id] = 1.
@@ -75,7 +81,7 @@ def stage_observation(stage_id):
 
 def language_metadata():
     return {
-        "version": "grasp_stage_language/v2",
+        "version": "grasp_stage_language/v3",
         "labels": [{"id": index, "text": text, "instructions": list(STAGE_INSTRUCTIONS[index])}
                    for index, text in enumerate(STAGE_LABELS)],
         "expert_stages": list(EXPERT_STAGES),
@@ -83,6 +89,6 @@ def language_metadata():
         "alignment": "Each label describes the same pre-action row and its end-effector action.",
         "task_index": "Per-frame instruction index into meta/tasks.parquet, not the stage ID; each episode uses one sentence per stage.",
         "sampling": "One instruction per stage sampled from the episode seed using an independent RNG stream; fixed throughout that stage, including its internal substages.",
-        "policy_condition": "language.stage is a 6-D one-hot stage condition; language.stage_id is its integer ID.",
+        "policy_condition": f"language.stage is a {len(STAGE_LABELS)}-D one-hot stage condition; language.stage_id is its integer ID.",
         "unlabelled": "stage_id=-1 and a zero vector when no expert stage has been selected.",
     }

@@ -1,6 +1,6 @@
 # ReposeEnv
 
-[Mendax-L/ReposeEnv](https://github.com/Mendax-L/ReposeEnv) 提供 PushT 和双臂 AlignBox3D 仿真、示范采集与策略执行；模型训练由相邻的 [ActionExpert](../ActionExpert/README.md) 负责。
+[Mendax-L/ReposeEnv](https://github.com/Mendax-L/ReposeEnv) 提供 PushT 和双臂 AlignBox3D 仿真、示范采集与策略执行；本项目的 π₀.₅ 数据导出、训练及验证由相邻的 [Pi05AlignBox3D](../Pi05AlignBox3D/README.md) 负责。
 
 ## 安装与结构
 
@@ -36,24 +36,22 @@ ReposeEnv/
 
 ## 自动采集
 
-```powershell
-python -m alignbox3d.collect --episodes 100 --max-attempts 500 --workers 4
-```
+流程为：接近 → 渐进加紧 → 抬起 → 搬运对齐 → 放下 → 渐进松开并撤离 → 稳定验收。每步控制两个末端和夹爪，箱体通过真实碰撞接触运动。只保存成功示范；指定 `--output` 时目录必须尚不存在；未指定时使用带时间戳的默认目录。默认对每只夹爪的停放位姿独立施加各轴 ±8 mm 扰动。`--episode-mode mixed` 按 `--recovery-fraction` 和 `--contact-error-fraction` 概率采样恢复类型；错误抵箱概率默认是 0。下方生产配方使用混合模式，并将错误抵箱尝试概率设为 20%。
 
-流程为：接近 → 渐进加紧 → 抬起 → 搬运对齐 → 放下 → 渐进松开并撤离 → 稳定验收。每步控制两个末端和夹爪，箱体通过真实碰撞接触运动。只保存成功示范，默认输出到 `training_data/lerobot/alignbox3d/grasp-carry-train-日期时间/`；`--output` 可以指定一个尚不存在的目录。
-
-训练集和验证集共用 `config/alignbox3d_data.yml`，分别生成独立的 LeRobot 目录：
+训练集和验证集共用 `config/alignbox3d_data.yml`。当前 π₀.₅ 生产配方在各 split 内混合正常与错误抵箱恢复轨迹，训练共 200 条、验证共 24 条：
 
 ```powershell
-python -m alignbox3d.collect --split train --episodes 100 --workers 4 --output training_data/lerobot/alignbox3d/train
-python -m alignbox3d.collect --split validation --episodes 12 --workers 4 --output training_data/lerobot/alignbox3d/validation
+python -m alignbox3d.collect --split train --episodes 200 --workers 4 --seed 500000 --recovery-fraction 0 --contact-error-fraction 0.20 --output training_data/lerobot/alignbox3d/pi05_train
+python -m alignbox3d.collect --split validation --episodes 24 --workers 4 --seed 900000 --recovery-fraction 0 --contact-error-fraction 0.20 --output training_data/lerobot/alignbox3d/pi05_validation
 ```
 
-`--data-config` 可指定另一份同结构配置。当前 `.yml` 文件内容必须使用 **JSON 语法**，由 Python 标准库 `json` 解析；后缀是历史命名，不能直接写成普通 YAML 缩进语法。采集前可运行 `python -m json.tool config/alignbox3d_data.yml > /dev/null` 检查语法。文件声明相机/光照随机范围、两侧的 `[start, stop)` seed 范围以及验证专用搭配规则。默认训练范围 `[500000,900000)`、验证范围 `[900000,1000000)`；采集器拒绝越界种子，工作进程使用同一配置。训练侧排除所有匹配 `holdout_rules` 的搭配，验证侧按 `visuals` 样例顺序轮换。配置和实际 split 保存到 `meta/data_split.json`、schema 和采集报告中。ActionExpert 的 `data.dataset` 指向训练目录，`data.validation_dataset` 指向验证目录后，直接使用该划分。
+采集完成后，使用 [Pi05AlignBox3D 的完整 recipe](../Pi05AlignBox3D/README.md) 导出固定高层任务数据，并从 LeRobot 的 `lerobot/pi05_base` 微调 π₀.₅。首轮训练设置为 3000 步、只在末步保存 checkpoint。原始轨迹的阶段句子仅供导出时校验，不直接作为模型训练指令。
 
-`--workers` 默认 1，设为 4 即启动四个独立仿真进程。主进程按 seed 顺序合并成功轨迹，重新生成全局编号和统计，视频直接复制。`--episodes` 指成功条数；失败只记录到 `meta/collection.json`。达到 `--max-attempts` 仍不足目标时保留已成功的数据并报错；默认最多尝试成功目标条数的五倍。
+`--data-config` 可指定另一份同结构配置。当前 `.yml` 文件内容必须使用 **JSON 语法**，由 Python 标准库 `json` 解析；后缀是历史命名，不能直接写成普通 YAML 缩进语法。采集前可运行 `python -m json.tool config/alignbox3d_data.yml > /dev/null` 检查语法。文件声明相机/光照随机范围、两侧的 `[start, stop)` seed 范围以及验证专用搭配规则。默认训练范围 `[500000,900000)`、验证范围 `[900000,1000000)`；采集器拒绝越界种子，工作进程使用同一配置。训练侧排除所有匹配 `holdout_rules` 的搭配，验证侧按 `visuals` 样例顺序轮换。配置和实际 split 保存到 `meta/data_split.json`、schema 和采集报告中。训练和验证使用不重叠 seed 段，避免重复物理场景。
 
-抓点在上箱局部坐标系中采样：各自前后偏移 ±10 mm、高度偏移 ±5 mm，两点前后差 ≤2 mm、高度差 ≤5 mm。夹持朝向共享扰动各轴 ±1.5°，每臂再加各轴 ±0.25°；初始箱体 roll/pitch 各 ±2°，允许通过 `--initial-tilt-deg` 调到最大 5°。相同 seed 复现初态与抓点；重力稳定后按实测箱体姿态规划。
+`--workers` 默认 1，设为 4 即启动四个独立仿真进程。主进程按 seed 顺序合并成功轨迹，重新生成全局编号和统计，视频直接复制。`--episodes` 指成功条数；失败只记录到 `meta/collection.json`。达到 `--max-attempts` 仍不足目标时保留已成功的数据并报错；默认最多尝试成功目标条数的五倍。上述配方对尝试按 80% 正常、20% 错误抵箱重抓采样，成功筛选会改变落盘比例；检查 `meta/collection.json` 的 `saved_by_recovery_stage`，确认两类数据都存在。逐帧 `collection.recovery_mode_id` 为 0 正常、1 接近偏移、2 持箱偏移、3 错误抵箱重抓，属于采集元数据，不进入模型输入。
+
+抓点在上箱局部坐标系中采样：各自前后偏移 ±10 mm、高度偏移 ±5 mm，两点前后差 ≤2 mm、高度差 ≤5 mm。夹持朝向共享扰动各轴 ±1.5°，每臂再加各轴 ±0.25°；初始箱体 roll/pitch 各 ±2°，允许通过 `--initial-tilt-deg` 调到最大 5°。夹爪起点扰动可用 `--initial-tool-jitter-mm` 调整到 0–15 mm。`--recovery-fraction` 与 `--contact-error-fraction` 分别控制接近/持箱偏移和错误抵箱重抓的尝试比例，两者之和不得超过 1。错误抵箱时只闭合一侧夹爪，必须测得该侧箱体接触力至少 1 N、另一侧不超过 0.3 N；从此状态开始录制松开、退出箱沿、重新规划、重抓和最终对齐。制造错误接触的动作不进入训练。相同 seed 复现初态、抓点与恢复场景；重力稳定后按实测箱体姿态规划。
 
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
@@ -66,6 +64,9 @@ python -m alignbox3d.collect --split validation --episodes 12 --workers 4 --outp
 | `--free-angular-speed-deg-s` / `--angular-speed-deg-s` | 24 / 12 | 空载、接触或持箱时旋转速度上限 |
 | `--gripper-speed-mm-s` | 4 | 驱动手指目标行程的变化速度上限 |
 | `--lift-mm` | 20 | 箱体几何中心的规划抬升量 |
+| `--initial-tool-jitter-mm` | 8 | 双夹爪停放位置各 XYZ 轴独立扰动范围，单位 mm |
+| `--recovery-fraction` / `--recovery-offset-mm` | 0.25 / 10 | 尝试恢复采样的概率与偏离幅度上限 |
+| `--contact-error-fraction` / `--contact-error-height-mm` | 0 / 20 | 错误抵箱重抓的尝试概率与错误抓点高度上限；高度范围 10–25 mm |
 
 夹爪用五次平滑曲线渐进开合，默认 12 mm 行程变化约需 5.6 s，再停稳至少 0.4 s。闭合时箱体异常升起超过 1.5 mm 或峰值速度超过 25 mm/s，该尝试会被拒绝。运动默认不启用额外加速度限制；需要时用 `--acceleration-mm-s2` 指定。其余随机范围和选项见 `python -m alignbox3d.collect --help`。
 
@@ -73,7 +74,7 @@ python -m alignbox3d.collect --split validation --episodes 12 --workers 4 --outp
 
 ### 视觉随机化
 
-默认 `--visual-mode all`：工业柔和配色、三档箱体结构、物料、相机和光照随机化。三档结构为 `ribbed_level=0` 无筋、`1` 边缘加强筋、`2` 边缘与面板加强筋；箱体尺寸 240×300×120 mm。加强筋和物料只影响外观，保持箱体质量、惯量和碰撞结构一致。
+默认 `--visual-mode all`：工业柔和配色、三档箱体结构、物料、相机和光照随机化。三档结构为 `ribbed_level=0` 无筋、`1` 边缘加强筋、`2` 边缘与面板加强筋；箱体尺寸 240×300×120 mm。加强筋和物料只影响外观，保持箱体质量、惯量和碰撞结构一致。夹爪保留原始 ARX L5 可视网格；手指内部指垫碰撞盒增大，侧壁抓点上移 5 mm，以减少网格进入箱沿。环境记录夹爪接触的最大物理穿透深度；箱沿穿透超过 1.5 mm 的尝试判为失败。
 
 相机位置各轴默认 ±10 mm、旋转各轴 ±1°，灯光强度系数 0.8–1.2，均由共用数据配置设置。训练可选模式为 `baseline/color/ribbing/contents/camera/lighting/all`；验证固定使用 `all`。搭配划分集中定义在 `config/alignbox3d_data.yml` 的 `splits.validation.holdout_rules` 中，例如以下 JSON 片段：
 
@@ -113,7 +114,7 @@ AlignBox3D 动作顺序由 `config/alignbox3d.yml` 定义：左末端 XYZ、左�
 
 频率和步长语义随数据集、接口契约和 checkpoint 保存，其中 `timing` 记录 policy/recording/control/physics 四项频率。AlignBox3D 当前动作语义版本为 `dual_ee_delta_xyz_local_roll_pitch_yaw_gripper_abs_0_1/v4`；旧数据与 checkpoint 应匹配原环境，新配置需重新采集和训练。策略频率表示动作执行的仿真时间间隔；一次预测可返回多个动作，模型请求频率由执行的动作数决定，也不保证仿真实时运行。
 
-重置后夹爪张开并与箱体分离，最低指尖至少高于旋转后箱体最高点 20 mm；平放时工具参考点 Z=0.362 m，最大初始倾斜时约 0.408 m。环境由动作直接控制末端，不执行隐式抓取或升降。
+重置后夹爪张开并与箱体分离，最低指尖至少高于旋转后箱体最高点 20 mm；未指定停放偏移且箱体平放时工具参考点 Z=0.362 m。`reset(options={"initial_tool_offsets_m": [[dx,dy,dz],[dx,dy,dz]]})` 可以分别设置两臂起点偏移，各分量限于 ±15 mm，并仍执行安全高度与 IK 检查。环境由动作直接控制末端，不执行隐式抓取或升降。
 
 ```python
 from environment import make_environment
@@ -140,7 +141,7 @@ LeRobot v3.0 = Parquet 数值数据、同步 MP4 视频和字段/轨迹元数据
 
 每批目录包含 `data/`、`videos/`、`meta/info.json`、`meta/stats.json`、`meta/tasks.parquet`、`meta/episodes/`、`meta/pushenv_schema.json` 与 `meta/provenance.json`。`pushenv_schema.json` 保留固定格式名以兼容已有数据；公共观测字段由环境 YAML 决定。自动示范额外保存采集报告、源码快照、视觉字典及语言字典。
 
-逐帧语言阶段固定为：**接近 → 加紧 → 抬起 → 搬运对齐 → 放下 → 松开撤离**。每个阶段提供 4 种完整中文指令，例如“请保持双臂协同，平稳抬起已经夹紧的上箱。”；每条轨迹按 seed 为各阶段选择一句，同一阶段（含内部子阶段）保持不变，且不影响物理随机采样。`language.stage_id` 为 0–5，`language.stage` 为对应的 6 维独热向量；每帧 `task_index` 指向 `meta/tasks.parquet` 中实际使用的完整句子，不能当作阶段 ID。全部候选句与阶段关系保存在 `meta/language.json` 和 schema 中，采集报告记录该轨迹所选句子。未标注时 ID 为 -1、向量全零。这些字段独立于 20 维 robot state 与 14 维动作；15 个内部控制子阶段由 `alignbox3d/stage_labels.py` 统一映射为六个语言阶段。
+逐帧语言阶段为：**接近 → 加紧 → 抬起 → 搬运对齐 → 放下 → 松开撤离**；错误抵箱轨迹先出现第七类 **重新抓取**，然后重新进入接近阶段。每类提供 4 种完整中文指令；每条轨迹按 seed 为各阶段选择一句，同一阶段保持不变。`language.stage_id` 为 0–6，`language.stage` 为 7 维独热向量；每帧 `task_index` 指向 `meta/tasks.parquet` 中实际使用的完整句子，不能当作阶段 ID。全部候选句与阶段关系保存在 `meta/language.json` 和 schema 中。未标注时 ID 为 -1、向量全零。这些字段独立于 20 维 robot state 与 14 维动作；16 个内部控制子阶段由 `alignbox3d/stage_labels.py` 映射为七类语言阶段。
 
 `collection.*` 保存抓点、扰动、内部阶段和视觉参数，作为采集元数据。数据校验检查阶段 ID、独热向量和任务文本的一致性。`meta/collection.json` 记录所有尝试与拒绝原因；`meta/provenance.json` 记录参数、运行版本和源码指纹。
 
@@ -153,17 +154,10 @@ python policy_interface.py --env alignbox3d --obs image --export-contract traini
 python policy_interface.py --env alignbox3d --host 127.0.0.1 --port 8765 --episodes 10
 ```
 
-模型侧在 ActionExpert 环境运行；仿真侧在 ReposeEnv 环境运行。TCP = 本机或网络进程之间的通信连接，策略启动时核对维数、字段顺序、单位和动作语义。
+π₀.₅ 模型侧在 `lerobot-pi05` 环境运行；仿真侧在 `ReposeEnv` 环境运行。TCP = 本机或网络进程之间的通信连接，策略启动时核对维数、字段顺序、单位和动作语义。
 
 排查在线推理时，可给 `policy_interface.py` 增加 `--trace 路径.jsonl`。它逐行刷新 `episode_start`、`prediction_request`、`prediction`、`action`、`episode_end` 事件：请求行含动作前 20 维状态和指令，预测行含 `[n,14]` 动作块，动作行含实际执行的 14 维动作、下一状态、奖励、成功标志及阶段。模型报错时，最后一条 `prediction_request` 也会保留。
 
-在线 `predict.obs` 保留 `robot_state` 和 `env` 的命名字段；图像用 RGB uint8 HWC 的 shape/base64 编码，指令使用自然语言字符串（历史窗口使用字符串列表）。ActionExpert 按 checkpoint 中保存的 YAML 顺序拼接 `robot_state`，与训练的 `observation.state` 完全一致。数据落盘时相机才使用 LeRobot 的 `observation.images.camera2` / `observation.images.front`，语言通过逐帧 `task_index` 关联 `meta/tasks.parquet`。观测、图像和语言都是动作前同一时刻的数据。字段顺序、旋转语义或 FPS 改变后需重新采集和训练，旧 checkpoint 不会自动转换。
+在线 `predict.obs` 保留 `robot_state` 和 `env` 的命名字段；图像用 RGB uint8 HWC 的 shape/base64 编码，指令使用自然语言字符串（历史窗口使用字符串列表）。Pi05AlignBox3D 依据导出数据保存的接口契约拼接 `robot_state`，与训练的 `observation.state` 保持同一字段顺序。数据落盘时相机使用 LeRobot 的 `observation.images.camera2` / `observation.images.front`，语言通过逐帧 `task_index` 关联 `meta/tasks.parquet`。观测、图像和语言都是动作前同一时刻的数据。字段顺序、旋转语义或 FPS 改变后需重新采集和训练，旧 checkpoint 不会自动转换。
 
-训练模型的演示入口位于相邻 ActionExpert 仓库的 `demo.py`。在 ActionExpert 环境执行，它会启动模型服务，并用 ReposeEnv 解释器打开验证场景，默认显示总览与近景：
-
-```powershell
-Set-Location Z:\ActionExpert
-python demo.py outputs/alignbox3d/qwen_vlm_run01/best.pt --episodes 6 --record-video
-```
-
-默认通过 `conda run -n ReposeEnv python` 启动仿真，也可用 `--reposeenv-python E:\anaconda3\envs\ReposeEnv\python.exe` 显式指定解释器。`--data-config` 与采集使用同一 YAML；`--no-show` 关闭窗口，`--dry-run` 只打印启动命令。报告和录像放在 checkpoint 所在训练目录的 `inference/` 下。
+训练模型的闭环验证入口位于相邻 [Pi05AlignBox3D](../Pi05AlignBox3D/README.md) 的 `validate.py`。它启动 π₀.₅ 模型服务，再通过 `conda run -n ReposeEnv python` 执行本仓库的 `policy_interface.py`，输出成功率、逐步轨迹和 camera2 录像。运行命令及路径设置见该项目 README 第 6 步。

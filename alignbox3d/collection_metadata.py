@@ -12,7 +12,8 @@ from .diversity import (
 
 def metadata_dictionary(config, data_config=None):
     return {
-        "version": 6, "config": asdict(config), "render_style": RENDER_STYLE,
+        "version": 8, "config": asdict(config), "render_style": RENDER_STYLE,
+        "recovery_mode_id": {0: "normal", 1: "approach_offset", 2: "carry_offset", 3: "wrong_contact_regrasp"},
         "color_style_id": {0: "original", 1: COLOR_STYLE},
         "box_color_id": {index: {"name": name, "base_rgb": list(rgb)} for index, (name, rgb) in enumerate(BOX_PALETTE)},
         "table_color_id": {index: {"name": name, "base_rgb": list(rgb)} for index, (name, rgb) in enumerate(TABLE_PALETTE)},
@@ -31,13 +32,13 @@ def metadata_dictionary(config, data_config=None):
                   "*_rgba": "renderer RGBA values in [0,1]", "light_scale": "relative to original lights"},
         "pair_id": "Same seed and pair index across visual modes: identical physical initialization, motion and factor random streams. Group all equal pair_ids when splitting train/validation.",
         "camera": "Only camera2/closeup changes. Position deltas in world XYZ; rotation delta is local X then Y then Z quaternion composition. Both deltas are sampled once per episode. FOV unchanged.",
-        "geometry": "Nominal dimensions 240x300x120 mm. Original collision shell, inertia and gripper geometry unchanged. Ribs and contents are visual-only and collision-disabled.",
+        "geometry": "Nominal dimensions 240x300x120 mm. Original ARX L5 visible finger meshes retained. Distal finger contact boxes enlarged and side-wall grasp point raised 5 mm to clear the rim. Ribs and contents are visual-only and collision-disabled.",
         "heldout_signature_fields": list(HOLDOUT_SIGNATURE_FIELDS),
         "heldout_rules": (data_config["splits"]["validation"]["holdout_rules"]
                           if data_config is not None else list(HELDOUT_RULES)),
         "heldout_visual_configs": (data_config["splits"]["validation"]["visuals"]
                                    if data_config is not None else list(HELDOUT_VISUAL_CONFIGS)),
         "heldout_policy": "Training excludes any matching rule. Attributes within a rule are ANDed; rules are ORed; omitted attributes are unrestricted. Validation examples and model demos must match a rule.",
-        "expert_labels": "Only successful contact-grasp demonstrations are saved; per-frame stage instructions are defined in meta/language.json.",
+        "expert_labels": "Only successful contact-grasp demonstrations are saved. Recovery episodes begin at disturbed approach/carry states or a measured one-sided wrong contact. Mistake-making actions are omitted; wrong-contact episodes record opening, withdrawal, replanning and regrasp. Per-frame stage instructions are defined in meta/language.json.",
         "policy_inputs": "collection.* are experimental metadata, excluded from observation.state and action; existing image/state models ignore them.",
     }

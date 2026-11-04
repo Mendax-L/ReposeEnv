@@ -27,14 +27,35 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
     started = perf_counter()
     rng = np.random.default_rng(np.random.SeedSequence([seed, 72]))
     tilt = np.deg2rad(rng.uniform(-settings["initial_tilt_deg"], settings["initial_tilt_deg"], 2))
+    tool_rng = np.random.default_rng(np.random.SeedSequence([seed, 74]))
+    tool_jitter = settings["initial_tool_jitter_mm"] / 1000
+    tool_offsets = tool_rng.uniform(-tool_jitter, tool_jitter, (2, 3))
+    recovery_rng = np.random.default_rng(np.random.SeedSequence([seed, 75]))
+    recovery_draw = recovery_rng.random()
+    mode = settings["episode_mode"]
+    if mode == "mixed":
+        contact_error = recovery_draw < settings["contact_error_fraction"]
+        recovery = bool(recovery_draw < settings["contact_error_fraction"]+settings["recovery_fraction"])
+        recovery_stage = ("contact_error" if contact_error else
+                          ("approach", "carry")[int(recovery_rng.integers(2))])
+    else:
+        recovery = mode != "normal"
+        recovery_stage = (("approach", "carry")[int(recovery_rng.integers(2))]
+                          if mode == "offset_recovery" else "approach" if mode == "normal" else mode)
+    recovery_offset = settings["recovery_offset_mm"] / 1000
     environment.reset(seed, options={"terminate_on_alignment": False,
-        "roll": float(tilt[0]), "pitch": float(tilt[1]), "visual_mode": settings["visual_mode"]})
+        "roll": float(tilt[0]), "pitch": float(tilt[1]), "visual_mode": settings["visual_mode"],
+        "initial_tool_offsets_m": tool_offsets})
     initial = environment.environment.data.qpos[
         environment.environment.box_qadr:environment.environment.box_qadr+7].copy().tolist()
     result = collect_grasp_episode(environment, writer, seed, config=config,
-                                   max_steps=settings["max_steps"])
+                                   max_steps=settings["max_steps"],
+                                   recovery=recovery, recovery_offset_m=recovery_offset,
+                                   recovery_stage=recovery_stage,
+                                   contact_error_height_m=settings["contact_error_height_mm"]/1000)
     result.update(attempt=attempt, initial_box_pose_world=initial,
-                  initial_roll_pitch_rad=tilt.tolist(), visual_parameters=environment.episode_metadata(),
+                  initial_roll_pitch_rad=tilt.tolist(), initial_tool_offsets_m=tool_offsets.tolist(),
+                  visual_parameters=environment.episode_metadata(),
                   worker_pid=os.getpid(), attempt_seconds=perf_counter()-started)
     return result
 
@@ -66,7 +87,13 @@ def collection_attempts(environment, writer, args, config):
     are never discarded merely because a slower, earlier attempt finished late.
     """
     from dataclasses import asdict
-    settings = {"initial_tilt_deg": args.initial_tilt_deg,
+    settings = {"episode_mode": args.episode_mode,
+                "initial_tilt_deg": args.initial_tilt_deg,
+                "initial_tool_jitter_mm": args.initial_tool_jitter_mm,
+                "recovery_fraction": args.recovery_fraction,
+                "recovery_offset_mm": args.recovery_offset_mm,
+                "contact_error_fraction": args.contact_error_fraction,
+                "contact_error_height_mm": args.contact_error_height_mm,
                 "visual_mode": args.visual_mode, "max_steps": args.max_steps}
     if args.workers == 1:
         def serial():

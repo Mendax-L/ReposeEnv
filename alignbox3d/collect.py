@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--max-attempts", type=int, help="Default: five attempts per requested success.")
     parser.add_argument("--data-config", type=Path, default=DEFAULT_DATA_CONFIG, help="Shared training/validation scene config (JSON syntax in a legacy .yml file).")
     parser.add_argument("--split", choices=("train", "validation"), default="train")
+    parser.add_argument("--episode-mode", choices=("mixed", "normal", "offset_recovery", "contact_error"),
+                        default="mixed", help="Force one trajectory type per output directory; mixed uses the recovery fractions.")
     parser.add_argument("--seed", type=int, help="First attempt seed; defaults to the selected split's range start.")
     parser.add_argument("--render-size", type=int, default=256)
     parser.add_argument("--visual-mode", choices=VISUAL_MODES, default="all")
@@ -51,6 +53,16 @@ def main():
     parser.add_argument("--angle-jitter-deg", type=float, default=1.5)
     parser.add_argument("--independent-angle-deg", type=float, default=.25)
     parser.add_argument("--initial-tilt-deg", type=float, default=2.)
+    parser.add_argument("--initial-tool-jitter-mm", type=float, default=8.,
+                        help="Independent XYZ jitter of each parked gripper, within a safe reachability window.")
+    parser.add_argument("--recovery-fraction", type=float, default=.25,
+                        help="Fraction of attempts recorded from a disturbed approach or held-box carry state.")
+    parser.add_argument("--recovery-offset-mm", type=float, default=10.,
+                        help="Maximum approach-tool or held-box displacement for recovery demonstrations.")
+    parser.add_argument("--contact-error-fraction", type=float, default=0.,
+                        help="Fraction of attempts starting from a real one-sided wrong box contact before regrasping.")
+    parser.add_argument("--contact-error-height-mm", type=float, default=20.,
+                        help="Maximum height error of the gripper that presses the box, 10-25 mm.")
     parser.add_argument("--lift-mm", type=float, default=20.)
     args = parser.parse_args()
     try:
@@ -73,6 +85,16 @@ def main():
         parser.error("render-size must be even and at least 16.")
     if not np.isfinite(args.initial_tilt_deg) or not 0 <= args.initial_tilt_deg <= 5:
         parser.error("initial-tilt-deg must be within [0,5].")
+    if (not np.isfinite([args.initial_tool_jitter_mm, args.recovery_fraction,
+                         args.recovery_offset_mm, args.contact_error_fraction,
+                         args.contact_error_height_mm]).all()
+            or not 0 <= args.initial_tool_jitter_mm <= 15
+            or not 0 <= args.recovery_fraction <= 1
+            or not 0 <= args.contact_error_fraction <= 1
+            or args.recovery_fraction+args.contact_error_fraction > 1
+            or not 0 <= args.recovery_offset_mm <= 15
+            or not 10 <= args.contact_error_height_mm <= 25):
+        parser.error("Jitter/offset must be 0-15 mm; contact error height 10-25 mm; recovery fractions must sum to at most 1.")
     try:
         config = GraspConfig(point_y_range_m=args.grasp_y_mm/1000,
             point_z_range_m=args.grasp_z_mm/1000, pair_y_difference_m=args.pair_y_difference_mm/1000,
@@ -108,9 +130,16 @@ def main():
         snapshots["config/alignbox3d_data.yml"] = args.data_config.read_bytes()
         schema = recording_schema(environment)
         schema["grasp_expert"] = {"config": asdict(config), "stages": list(EXPERT_STAGES),
+            "episode_mode": args.episode_mode,
             "initial_tilt_range_degrees": [-args.initial_tilt_deg, args.initial_tilt_deg],
             "sampling_frame": "upper-box local frame, origin at bottom centre",
             "box_path_frame": "shared world; path follows the geometric box centre",
+            "initial_tool_jitter_mm": args.initial_tool_jitter_mm,
+            "recovery_fraction": args.recovery_fraction,
+            "recovery_offset_mm": args.recovery_offset_mm,
+            "contact_error_fraction": args.contact_error_fraction,
+            "contact_error_height_mm": args.contact_error_height_mm,
+            "recovery_sampling": "Recovery episodes begin recording after an unrecorded approach/carry displacement or measured one-sided wrong box contact. Contact-error episodes record opening, withdrawal, replanning, regrasp and final success; mistake-making actions are excluded.",
             "acceptance": "physical lift, aligned placement, open grippers, withdrawal and stable released alignment",
             "selection_bias": "only physically successful and reachable attempts are saved; all rejected attempts remain in collection.json"}
         provenance = {"kind": "scripted_contact_grasp_carry_release", "human_demonstration": False,
@@ -142,6 +171,9 @@ def main():
                 write_json(output/"meta/collection.json", {"kind": provenance["kind"],
                     "requested_episodes": args.episodes, "saved_episodes": saved,
                     "attempts": len(records), "failed_attempts": len(records)-saved,
+                    "saved_by_recovery_stage": {name: sum(bool(row["saved"]) and
+                        (row.get("recovery_stage") or "none") == name for row in records)
+                        for name in ("none", "approach", "carry", "contact_error")},
                     "workers": args.workers, "split": args.split, "ordering": "seed_ascending",
                     "complete": saved == args.episodes, "episodes": records})
                 print(json.dumps({key: result.get(key) for key in

@@ -9,7 +9,7 @@ from gymnasium import spaces
 import mujoco
 from common.config import load_environment_config
 
-from .model import (ARM_NAMES, ARM_HOME,
+from .model import (ARM_NAMES, ARM_HOME, BOX_SIZE,
                     TIP_ROTATIONS, UPPER_REST_Z, build_scene)
 from .kinematics import ArmIK
 from ..geometry import box_rotation, quaternion
@@ -136,6 +136,8 @@ class StackedBoxesEnv(gym.Env):
         self.unintended_contact_count = 0
         self.unintended_contact_peak = 0.
         self.unintended_contact_pairs = set()
+        self.max_finger_box_penetration_m = 0.
+        self.max_rim_penetration_m = 0.
         self._renderers = {}
         self.steps = self.stable_steps = 0
         self.ik_clipped = False
@@ -315,6 +317,10 @@ class StackedBoxesEnv(gym.Env):
         randomized = "offset" not in options and bool(options.get("randomize", True))
         random_yaw = bool(options.get("randomize", True)) and "yaw" not in options
         random_tilt = bool(options.get("randomize_tilt", randomized and random_yaw))
+        tool_offsets = np.asarray(options.get("initial_tool_offsets_m", np.zeros((2, 3))), dtype=float)
+        if (tool_offsets.shape != (2, 3) or not np.isfinite(tool_offsets).all()
+                or np.any(np.abs(tool_offsets) > .015)):
+            raise ValueError("initial_tool_offsets_m must be finite 2x3 offsets within +/-15 mm")
         roll = float(options.get("roll", self.np_random.uniform(-self.initial_tilt_range, self.initial_tilt_range) if random_tilt else 0.))
         pitch = float(options.get("pitch", self.np_random.uniform(-self.initial_tilt_range, self.initial_tilt_range) if random_tilt else 0.))
         if not np.isfinite([roll, pitch]).all() or max(abs(roll), abs(pitch)) > self.initial_tilt_limit:
@@ -331,7 +337,7 @@ class StackedBoxesEnv(gym.Env):
             if abs(yaw) > self.yaw_limit:
                 raise ValueError(f"reset yaw must lie within +/-{math.degrees(self.yaw_limit):g} degrees")
             rotation = np.eye(3)
-            targets = np.asarray(type(self).initial_tip_positions, dtype=float).copy()
+            targets = np.asarray(type(self).initial_tip_positions, dtype=float).copy() + tool_offsets
             inside = not (np.any(targets < self.workspace_low - 1e-9) or np.any(targets > self.workspace_high + 1e-9))
             if inside:
                 break
@@ -354,8 +360,8 @@ class StackedBoxesEnv(gym.Env):
         top = bottom.copy()
         top[:,2] = BOX_SIZE[2]
         box_top = initial_z + float(np.max((top @ box_orientation.T)[:,2]))
-        # Extra 22 mm covers the visible finger mesh below its pad-centre site.
-        targets[:,2] = max(float(targets[0,2]), box_top+self.initial_finger_clearance_m+.022)
+        # Keep a conservative wrist and finger margin above the rotated rim.
+        targets[:,2] = np.maximum(targets[:,2], box_top+self.initial_finger_clearance_m+.022)
         parking_rotation = self._rotation_increment(np.array([self.initial_tool_tilt_radians,0.,0.]))
         self.initial_tip_rotations = parking_rotation @ self.rest_tip_rotations
         mujoco.mj_resetData(self.model, self.data)
@@ -390,6 +396,7 @@ class StackedBoxesEnv(gym.Env):
         else:
             raise RuntimeError("Could not place both visible finger tips above the box")
         self.initial_tip_positions = targets.copy()
+        self.initial_tool_offsets_m = tool_offsets.copy()
         self.initial_box_top_height = self.box_highest_z
         self.initial_finger_lowest_heights = self.finger_lowest_heights.copy()
         self.steps = self.stable_steps = 0
@@ -403,6 +410,8 @@ class StackedBoxesEnv(gym.Env):
         self.unintended_contact_count = 0
         self.unintended_contact_peak = 0.
         self.unintended_contact_pairs.clear()
+        self.max_finger_box_penetration_m = 0.
+        self.max_rim_penetration_m = 0.
         mujoco.mj_forward(self.model, self.data)
         return self._observation(), self._info()
 
@@ -428,6 +437,14 @@ class StackedBoxesEnv(gym.Env):
             other = g2 if g1 in self.upper_geoms else g1
             for arm, geoms in enumerate(self.probe_geoms):
                 if other in geoms:
+                    depth = max(0., -float(contact.dist))
+                    self.max_finger_box_penetration_m = max(self.max_finger_box_penetration_m, depth)
+                    box_z = float((np.asarray(contact.pos)-self.data.xpos[self.box_id])
+                                  @ self.data.xmat[self.box_id].reshape(3, 3)[:, 2])
+                    if box_z >= BOX_SIZE[2]-.010:
+                        self.max_rim_penetration_m = max(self.max_rim_penetration_m, depth)
+                        if depth > .0015:
+                            self.failure_reason = "rim_penetration"
                     mujoco.mj_contactForce(self.model, self.data, i, wrench)
                     values[arm] += max(0., wrench[0])
         return values
@@ -502,6 +519,7 @@ class StackedBoxesEnv(gym.Env):
                    or np.any(grip_positions > self.workspace_high + .025))
         failure = (not finite or tilt > .20 or outside
                    or self.unintended_contact_peak > 5.
+                   or self.max_rim_penetration_m > .0015
                    or self.failure_reason is not None)
         target_height = self.control_height
         lifted_height = float(pos[2] - UPPER_REST_Z)
@@ -510,6 +528,7 @@ class StackedBoxesEnv(gym.Env):
                 "initial_roll_pitch": self.initial_roll_pitch.copy(),
                 "initial_box_top_height": self.initial_box_top_height,
                 "initial_finger_lowest_heights": self.initial_finger_lowest_heights.copy(),
+                "initial_tool_offsets_m": self.initial_tool_offsets_m.copy(),
                 "gripper_positions": self.gripper_positions,
                 "gripper_targets": self.gripper_targets.copy(),
                 "tip_target_rotations": self.tip_target_rotations.copy(),
@@ -537,6 +556,8 @@ class StackedBoxesEnv(gym.Env):
                 "peak_forces": self.peak_forces.copy(), "had_contact": self.had_contact.copy(),
                 "unintended_contact_count": self.unintended_contact_count,
                 "unintended_contact_peak": self.unintended_contact_peak,
+                "max_finger_box_penetration_m": self.max_finger_box_penetration_m,
+                "max_rim_penetration_m": self.max_rim_penetration_m,
                 "ik_clipped": bool(self.ik_clipped), "time": float(self.data.time)}
 
     def _observation(self):

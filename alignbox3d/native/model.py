@@ -6,7 +6,8 @@ free body moved by physical contact; the lower box is fixed. Reset starts
 with open grippers clear of the box.
 The vendored Google DeepMind MuJoCo
 Menagerie ARX L5 description supplies the original kinematic tree, inertia,
-joint limits, actuator torque limits, visual meshes, and collision geometry.
+joint limits, actuator torque limits, and visual meshes. The distal finger
+contact boxes are enlarged slightly to follow those visual meshes.
 Ideal gravity compensation (body gravcomp=1) is applied to both arms.
 This is a simulation assumption, not a model of the hardware controller.
 """
@@ -34,12 +35,12 @@ FINGER_OPENING = WALL_THICKNESS / 2 + .002 - .001898
 TIP_LOCAL_POSITION = (.13657, 0., -.00024363)
 TIP_SITE_QUAT = (math.sqrt(.5), 0., math.sqrt(.5), 0.)
 ARM_NAMES = ("inner", "outer")
-# Grip halfway up both side walls, at their fore/aft midpoint. The fingers
+# Grip slightly above halfway up both side walls, at their fore/aft midpoint. The fingers
 # descend 10 degrees from vertical, keeping the original palms above the rim
 # and both arms inside their original joint limits. Closing remains world X.
 GRIP_POINTS = (
-    (-(BOX_SIZE[0] - WALL_THICKNESS) / 2, 0., BOX_SIZE[2] / 2),
-    ((BOX_SIZE[0] - WALL_THICKNESS) / 2, 0., BOX_SIZE[2] / 2),
+    (-(BOX_SIZE[0] - WALL_THICKNESS) / 2, 0., BOX_SIZE[2] / 2 + .005),
+    ((BOX_SIZE[0] - WALL_THICKNESS) / 2, 0., BOX_SIZE[2] / 2 + .005),
 )
 GRIP_APPROACH_TILT = math.radians(10.)
 _s, _c = math.sin(GRIP_APPROACH_TILT), math.cos(GRIP_APPROACH_TILT)
@@ -172,6 +173,10 @@ def _arm_sections(name: str) -> dict[str, str]:
             geom.set("contype", "2")
             geom.set("conaffinity", "7")
             geom.set("friction", ".8 .005 .0001")
+            if index == 0:
+                # Cover the original distal mesh's contact-facing extent while
+                # keeping the original ARX L5 finger appearance unchanged.
+                geom.set("size", ".022 .002 .012")
     wrist = next(body for body in base.iter("body") if body.get("name") == f"{name}_link6")
     ET.SubElement(wrist, "site", {
         "name": f"{name}_tip", "pos": _fmt(TIP_LOCAL_POSITION), "quat": _fmt(TIP_SITE_QUAT),

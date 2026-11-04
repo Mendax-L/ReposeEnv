@@ -8,7 +8,7 @@ from .geometry import quaternion, rotation_vector, smoothstep
 from .native.model import BOX_SIZE, GRIP_POINTS
 from .stage_labels import EXPERT_STAGES, EXPERT_STAGE_LABEL_IDS, STAGE_LABELS, sample_stage_instructions
 FREE_TOOL_STAGES = frozenset(("approach_above", "approach_rim", "orient_grasp",
-                              "withdraw_orient", "withdraw_above", "park"))
+                              "withdraw_orient", "withdraw_above", "park", "recover_contact"))
 # Require measured stillness for 10 policy intervals (1/3 s at the default 30 Hz).
 # Per-frame thresholds are speed * dt: 50 um and 0.0167 deg at 30 Hz.
 TOOL_STILL_FRAMES = 10
@@ -84,13 +84,25 @@ class GraspFailure(RuntimeError):
 
 
 class GraspCarryExpert:
-    def __init__(self, environment, seed, *, config=None, step=None, max_steps=None):
+    def __init__(self, environment, seed, *, config=None, step=None, max_steps=None,
+                 recovery=False, recovery_offset_m=.010, recovery_stage="approach",
+                 contact_error_height_m=.020):
         self.environment = environment
         self.native = environment.environment
         self.config = config or GraspConfig()
         self.seed = int(seed)
         self.stage_instructions = sample_stage_instructions(self.seed)
-        self.step_callback = environment.step if step is None else step
+        self.record_step = environment.step if step is None else step
+        if recovery_stage not in ("approach", "carry", "contact_error"):
+            raise ValueError("recovery_stage must be approach, carry or contact_error")
+        if not math.isfinite(contact_error_height_m) or not .010 <= contact_error_height_m <= .025:
+            raise ValueError("contact_error_height_m must be within 10-25 mm")
+        self.recovery = bool(recovery and (recovery_stage == "contact_error" or recovery_offset_m > 0))
+        self.recovery_stage = recovery_stage if self.recovery else None
+        self.recovery_offset_m = float(recovery_offset_m)
+        self.contact_error_height_m = float(contact_error_height_m)
+        self.recovery_start = None
+        self.step_callback = environment.step if self.recovery else self.record_step
         self.max_steps = max_steps if max_steps is not None else math.ceil(100 / self.native.dt)
         self.frames = 0
         self.stage_counts = {}
@@ -104,6 +116,8 @@ class GraspCarryExpert:
         self.initial_box_pose = self.native.data.qpos[self.native.box_qadr:self.native.box_qadr+7].copy().tolist()
         if hasattr(environment, "collection_metadata"):
             environment.collection_metadata.update(
+                recovery_mode_id={None: 0, "approach": 1, "carry": 2,
+                                  "contact_error": 3}[self.recovery_stage],
                 grasp_points_box_m=self.sample["points_box_m"].tolist(),
                 grasp_angle_vectors_box_rad=self.sample["angle_vectors_box_rad"].tolist())
         self.grasp_relative_positions = self.grasp_relative_rotations = None
@@ -128,6 +142,14 @@ class GraspCarryExpert:
                            "instruction": self.stage_instructions[label_id],
                            "box_center_world_m": centre.tolist(),
                            "box_quaternion_wxyz": quaternion(rotation).tolist()})
+
+    def start_recovery_recording(self):
+        """Begin a new, continuous expert suffix at the disturbed state."""
+        self.frames = 0
+        self.stage_counts = {}
+        self.trace = []
+        self.stage_motion = {}
+        self.step_callback = self.record_step
 
     @staticmethod
     def limit_norm(vectors, maximum):
@@ -187,7 +209,7 @@ class GraspCarryExpert:
         metrics["peak_abs_box_vz_m_s"] = max(metrics["peak_abs_box_vz_m_s"], abs(float(velocity[2])))
         metrics["max_box_rise_m"] = max(metrics["max_box_rise_m"], float(n.pose[0][2])-self.stage_start_z)
         if transition.info["failure"]:
-            raise GraspFailure(f"physics_failure:{self.stage}:{sorted(n.unintended_contact_pairs)}")
+            raise GraspFailure(f"physics_failure:{self.stage}:{transition.info.get('failure_reason')}:{sorted(n.unintended_contact_pairs)}")
         if transition.done and not allow_complete:
             raise GraspFailure(f"premature_completion:{self.stage}")
         return transition
@@ -288,20 +310,9 @@ class GraspCarryExpert:
                 return
         raise GraspFailure(f"gripper_settle_timeout:{name}")
 
-    def run(self):
+    def grasp_targets(self):
+        """Replan from the measured box pose, including after a bad contact."""
         n = self.native
-        n.terminate_on_alignment = False
-        self.stage_start("initial_settle")
-        stable = 0
-        for index in range(math.ceil(2.5/n.dt)):
-            self.tick(np.asarray(n.initial_tip_positions), n.initial_tip_rotations,
-                      n.hold_action().reshape(2, 7)[:, 6])
-            velocity = n.data.qvel[n.box_dadr:n.box_dadr+6]
-            stable = stable+1 if np.linalg.norm(velocity) < .003 else 0
-            if (index + 1)*n.dt >= 1/3 and stable >= math.ceil((1/6)/n.dt):
-                break
-        else:
-            raise GraspFailure("initial_box_not_settled")
         body = n.pose[0].copy()
         rotation = n.data.xmat[n.box_id].reshape(3, 3).copy()
         points = self.sample["points_box_m"]
@@ -319,8 +330,96 @@ class GraspCarryExpert:
                              max_iterations=250, rotation=candidate_rotations[arm])
                 if not solver.converged:
                     raise GraspFailure("sampled_grasp_not_reachable")
+        return positions, grasp_rotations, approach_rotations
+
+    def create_contact_error(self, positions, grasp_rotations, approach_rotations, opening):
+        """Press one misplaced, partly closed gripper against the upper box."""
+        n = self.native
+        rng = np.random.default_rng(np.random.SeedSequence([self.seed, 78]))
+        arm = int(rng.integers(2))
+        height_error = float(rng.uniform(max(.010, self.contact_error_height_m*.75),
+                                         self.contact_error_height_m))
+        self.move_tools("approach_above", positions+[0, 0, .09], approach_rotations, opening)
+        self.move_tools("approach_rim", positions+[0, 0, .03], approach_rotations, opening)
+        self.move_tools("orient_grasp", positions+[0, 0, .03], grasp_rotations, opening)
+        wrong = positions.copy()
+        wrong[arm, 2] += height_error
+        self.move_tools("descend_to_grasp", wrong, grasp_rotations, opening,
+                        speed=self.config.contact_speed_m_s)
+        openings = np.full(2, opening)
+        openings[arm] = 0.
+        self.move_grippers("close_grippers", wrong, grasp_rotations, openings)
+        forces = n.contact_forces.copy()
+        if forces[arm] < 1. or forces[1-arm] > .3:
+            raise GraspFailure("contact_error_not_single_sided")
+        self.recovery_start = {"stage": "contact_error", "arm": arm,
+                               "height_error_m": height_error,
+                               "contact_forces_N": forces.tolist(),
+                               "wrong_tool_positions_world_m": n.tip_positions.tolist(),
+                               "box_pose_world": n.data.qpos[n.box_qadr:n.box_qadr+7].copy().tolist()}
+
+    def recover_contact(self, opening):
+        """Open, clear the rim, reorient, and park before replanning."""
+        n = self.native
+        self.move_grippers("recover_contact", n.tip_positions.copy(),
+                           n.tip_rotations.copy(), opening)
+        rim_positions = n.tip_positions.copy()
+        rim_positions[:, 2] += .010
+        self.move_tools("recover_contact", rim_positions, n.tip_rotations.copy(),
+                        opening, speed=self.config.contact_speed_m_s)
+        withdrawal_rotations = (n._rotation_increment(np.array([math.radians(20.), 0., 0.]))
+                                @ n.tip_rotations.copy())
+        self.move_tools("recover_contact", rim_positions, withdrawal_rotations, opening)
+        above_positions = rim_positions.copy()
+        above_positions[:, 2] = n.control_height+.15
+        self.move_tools("recover_contact", above_positions, withdrawal_rotations, opening)
+        self.move_tools("recover_contact", np.asarray(n.initial_tip_positions),
+                        n.initial_tip_rotations, opening)
+
+    def run(self):
+        n = self.native
+        n.terminate_on_alignment = False
+        self.stage_start("initial_settle")
+        stable = 0
+        for index in range(math.ceil(2.5/n.dt)):
+            self.tick(np.asarray(n.initial_tip_positions), n.initial_tip_rotations,
+                      n.hold_action().reshape(2, 7)[:, 6])
+            velocity = n.data.qvel[n.box_dadr:n.box_dadr+6]
+            stable = stable+1 if np.linalg.norm(velocity) < .003 else 0
+            if (index + 1)*n.dt >= 1/3 and stable >= math.ceil((1/6)/n.dt):
+                break
+        else:
+            raise GraspFailure("initial_box_not_settled")
         opening = .012/.044
-        self.move_tools("approach_above", positions+[0,0,.09], approach_rotations, opening)
+        positions, grasp_rotations, approach_rotations = self.grasp_targets()
+        if self.recovery_stage == "contact_error":
+            self.create_contact_error(positions, grasp_rotations, approach_rotations, opening)
+            self.start_recovery_recording()
+            self.recover_contact(opening)
+            positions, grasp_rotations, approach_rotations = self.grasp_targets()
+        above_positions = positions+[0,0,.09]
+        if self.recovery_stage == "approach":
+            # Construct a plausible off-path state before recording. Including
+            # the mistake-making actions would teach behavioural cloning to
+            # make that mistake, so the saved episode starts at correction.
+            self.step_callback = self.environment.step
+            self.move_tools("approach_above", above_positions, approach_rotations, opening)
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed, 76]))
+            arm = int(rng.integers(2))
+            direction = rng.normal(size=3)
+            direction /= np.linalg.norm(direction)
+            magnitude = rng.uniform(self.recovery_offset_m*.5, self.recovery_offset_m)
+            disturbed = above_positions.copy()
+            disturbed[arm] += direction*magnitude
+            disturbed[arm] = np.clip(disturbed[arm], n.workspace_low+.002, n.workspace_high-.002)
+            self.move_tools("approach_above", disturbed, approach_rotations, opening)
+            self.recovery_start = {"stage": "approach", "arm": arm,
+                                   "target_tool_positions_world_m": above_positions.tolist(),
+                                   "actual_tool_positions_world_m": n.tip_positions.tolist()}
+            self.start_recovery_recording()
+            self.move_tools("approach_above", above_positions, approach_rotations, opening)
+        else:
+            self.move_tools("approach_above", above_positions, approach_rotations, opening)
         self.move_tools("approach_rim", positions+[0,0,.03], approach_rotations, opening)
         self.move_tools("orient_grasp", positions+[0,0,.03], grasp_rotations, opening)
         self.move_tools("descend_to_grasp", positions, grasp_rotations, opening, speed=self.config.contact_speed_m_s)
@@ -335,6 +434,19 @@ class GraspCarryExpert:
                               "tool_rotations_box": self.grasp_relative_rotations.tolist()}
         lift_centre = centre + [0,0,self.config.lift_m]
         self.follow_carry_path("lift", lift_centre, rotation)
+        if self.recovery_stage == "carry":
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed, 77]))
+            direction = rng.normal(size=2)
+            direction /= np.linalg.norm(direction)
+            magnitude = rng.uniform(self.recovery_offset_m*.5, self.recovery_offset_m)
+            disturbed_centre, disturbed_rotation = self.box_pose()
+            disturbed_centre[:2] += direction*magnitude
+            self.follow_carry_path("carry_align", disturbed_centre, disturbed_rotation)
+            measured_centre, _ = self.box_pose()
+            self.recovery_start = {"stage": "carry",
+                                   "target_box_centre_world_m": [0., 0., float(lift_centre[2])],
+                                   "actual_box_centre_world_m": measured_centre.tolist()}
+            self.start_recovery_recording()
         self.follow_carry_path("carry_align", np.array([0.,0.,lift_centre[2]]), np.eye(3))
         self.follow_carry_path("lower", np.array([0.,0.,n.control_height+BOX_SIZE[2]/2]), np.eye(3))
         release_positions, release_rotations = n.tip_positions.copy(), n.tip_rotations.copy()
@@ -361,19 +473,30 @@ class GraspCarryExpert:
         raise GraspFailure("released_alignment_timeout")
 
     def metadata(self):
-        return {"controller": "contact_only_random_grasp_carry_release/v2", "seed": self.seed,
+        return {"controller": "contact_only_random_grasp_carry_release/v3", "seed": self.seed,
                 "initial_box_pose_world": self.initial_box_pose,
+                "recovery": self.recovery, "recovery_stage": self.recovery_stage,
+                "recovery_start": self.recovery_start,
+                "contact_error_height_m": self.contact_error_height_m,
                 "config": asdict(self.config), "stage_frames": self.stage_counts,
                 "stage_trace": self.trace, "frames": self.frames, "peak_lift_m": self.peak_lift_m,
+                "max_finger_box_penetration_m": self.native.max_finger_box_penetration_m,
+                "max_rim_penetration_m": self.native.max_rim_penetration_m,
                 "stage_instructions": list(self.stage_instructions),
                 "stage_motion": self.stage_motion,
                 "sampled_grasp": {key: value.tolist() for key, value in self.sample.items()},
                 "measured_grasp": getattr(self, "grasp_capture", None)}
 
 
-def collect_grasp_episode(environment, writer, seed, *, config=None, max_steps=None):
+def collect_grasp_episode(environment, writer, seed, *, config=None, max_steps=None,
+                          recovery=False, recovery_offset_m=.010, recovery_stage="approach",
+                          contact_error_height_m=.020):
     recorder = EpisodeRecorder(environment, buffer_dir=getattr(writer, "root", None))
-    expert = GraspCarryExpert(environment, seed, config=config, step=recorder.step, max_steps=max_steps)
+    expert = GraspCarryExpert(environment, seed, config=config, step=recorder.step,
+                             max_steps=max_steps, recovery=recovery,
+                             recovery_offset_m=recovery_offset_m,
+                             recovery_stage=recovery_stage,
+                             contact_error_height_m=contact_error_height_m)
     try:
         try:
             result = expert.run()

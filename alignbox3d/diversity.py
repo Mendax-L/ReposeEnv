@@ -44,7 +44,7 @@ CONTENT_STATES = (
 VISUAL_MODES = ("baseline", "color", "ribbing", "contents", "camera", "lighting", "all")
 # Muted industrial plastic colours, not exact commercial/RAL specifications.
 COLOR_STYLE = "industrial_muted/v1"
-RENDER_STYLE = "industrial_workcell_shadow/v2"
+RENDER_STYLE = "industrial_workcell_shadow/v3"
 BOX_PALETTE = (
     ("graphite", (.29, .31, .32)),
     ("slate_gray", (.47, .50, .51)),
@@ -71,6 +71,7 @@ HOLDOUT_SIGNATURE_FIELDS = ("ribbed_level", "upper_color_id", "lower_color_id", 
                             "content_type_id", "content_amount_id", "content_palette_id")
 FEATURES = {
     "expert_stage_id": ("int64", [1]),
+    "recovery_mode_id": ("int64", [1]),
     "grasp_points_box_m": ("float32", [2, 3]),
     "grasp_angle_vectors_box_rad": ("float32", [2, 3]),
     "pair_id": ("int64", [1]),
@@ -473,6 +474,7 @@ class DiverseAlignBox3DEnv(AlignBox3DEnv):
                 raise RuntimeError("Cannot sample a training visual outside the validation set.")
         self.collection_metadata = {
             "expert_stage_id": -1,
+            "recovery_mode_id": 0,
             "grasp_points_box_m": [[0., 0., 0.], [0., 0., 0.]],
             "grasp_angle_vectors_box_rad": [[0., 0., 0.], [0., 0., 0.]],
             "pair_id": int(seed), "pose_seed": int(seed),

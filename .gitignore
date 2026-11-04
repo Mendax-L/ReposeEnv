@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 
 # Generated datasets and user-requested runtime output.
 /training_data/
