@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--max-attempts", type=int, help="Default: five attempts per requested success.")
     parser.add_argument("--data-config", type=Path, default=DEFAULT_DATA_CONFIG, help="Shared training/validation scene config (JSON syntax in a legacy .yml file).")
     parser.add_argument("--split", choices=("train", "validation"), default="train")
-    parser.add_argument("--episode-mode", choices=("mixed", "normal", "offset_recovery", "contact_error", "grasp_ready"),
+    parser.add_argument("--episode-mode", choices=("mixed", "normal", "offset_recovery", "contact_error", "grasp_ready", "low_offset"),
                         default="mixed", help="Force one trajectory type per output directory; mixed uses the recovery fractions.")
     parser.add_argument("--seed", type=int, help="First attempt seed; defaults to the selected split's range start.")
     parser.add_argument("--render-size", type=int, default=256)
@@ -63,8 +63,12 @@ def main():
                         help="Fraction of attempts starting from measured wrong box contact with both grippers laterally offset.")
     parser.add_argument("--grasp-ready-fraction", type=float, default=0.,
                         help="Fraction of attempts recorded from a verified rim-between-fingers pose, immediately before closing.")
+    parser.add_argument("--low-offset-fraction", type=float, default=0.,
+                        help="Fraction of attempts starting with both grippers already below the rim and laterally misplaced.")
     parser.add_argument("--contact-error-lateral-mm", type=float, default=19.,
                         help="Both grippers' box-local lateral offsets for failed contact, 18-20 mm.")
+    parser.add_argument("--low-offset-mm", type=float, default=35.,
+                        help="Maximum lateral offset of lowered grippers; each arm samples 25 mm to this value (25-40 mm).")
     parser.add_argument("--lift-mm", type=float, default=20.)
     args = parser.parse_args()
     try:
@@ -89,15 +93,17 @@ def main():
         parser.error("initial-tilt-deg must be within [0,5].")
     if (not np.isfinite([args.initial_tool_jitter_mm, args.recovery_fraction,
                          args.recovery_offset_mm, args.contact_error_fraction, args.grasp_ready_fraction,
-                         args.contact_error_lateral_mm]).all()
+                         args.low_offset_fraction, args.contact_error_lateral_mm, args.low_offset_mm]).all()
             or not 0 <= args.initial_tool_jitter_mm <= 15
             or not 0 <= args.recovery_fraction <= 1
             or not 0 <= args.contact_error_fraction <= 1
             or not 0 <= args.grasp_ready_fraction <= 1
-            or args.recovery_fraction+args.contact_error_fraction+args.grasp_ready_fraction > 1
+            or not 0 <= args.low_offset_fraction <= 1
+            or args.recovery_fraction+args.contact_error_fraction+args.grasp_ready_fraction+args.low_offset_fraction > 1
             or not 0 <= args.recovery_offset_mm <= 15
-            or not 18 <= args.contact_error_lateral_mm <= 20):
-        parser.error("Jitter/offset must be 0-15 mm; contact error lateral offset 18-20 mm; recovery fractions must sum to at most 1.")
+            or not 18 <= args.contact_error_lateral_mm <= 20
+            or not 25 <= args.low_offset_mm <= 40):
+        parser.error("Jitter/recovery offset must be 0-15 mm; contact lateral 18-20 mm; low lateral 25-40 mm; fractions must sum to at most 1.")
     try:
         config = GraspConfig(point_y_range_m=args.grasp_y_mm/1000,
             point_z_range_m=args.grasp_z_mm/1000, pair_y_difference_m=args.pair_y_difference_mm/1000,
@@ -142,8 +148,10 @@ def main():
             "recovery_offset_mm": args.recovery_offset_mm,
             "contact_error_fraction": args.contact_error_fraction,
             "grasp_ready_fraction": args.grasp_ready_fraction,
+            "low_offset_fraction": args.low_offset_fraction,
             "contact_error_lateral_mm": args.contact_error_lateral_mm,
-            "recovery_sampling": "Recovery episodes begin recording after an unrecorded approach/carry displacement or measured wrong box contact. Both grippers are offset outside/inside their walls in four deterministic combinations; finger-pad geometry is checked before saving. Contact-error episodes record withdrawal, replanning, regrasp and final success; mistake-making actions are excluded. Grasp-ready episodes begin with both walls between fingers and immediately close.",
+            "low_offset_mm": args.low_offset_mm,
+            "recovery_sampling": "Recovery episodes begin recording after an unrecorded approach/carry displacement, measured wrong box contact, or both grippers lowered below the rim with lateral offsets. Both grippers are offset outside/inside their walls in four deterministic combinations; finger-pad geometry and low-pose depth are checked before saving. Mistake-making actions are excluded. Grasp-ready episodes begin with both walls between fingers and immediately close.",
             "acceptance": "physical lift, aligned placement, open grippers, withdrawal and stable released alignment",
             "selection_bias": "only physically successful and reachable attempts are saved; all rejected attempts remain in collection.json"}
         provenance = {"kind": "scripted_contact_grasp_carry_release", "human_demonstration": False,
@@ -177,8 +185,14 @@ def main():
                     "attempts": len(records), "failed_attempts": len(records)-saved,
                     "saved_by_recovery_stage": {name: sum(bool(row["saved"]) and
                         (row.get("recovery_stage") or "none") == name for row in records)
-                        for name in ("none", "approach", "carry", "contact_error", "grasp_ready")},
+                        for name in ("none", "approach", "carry", "contact_error", "grasp_ready", "low_offset")},
                     "saved_by_contact_pattern": {"/".join(pattern): sum(bool(row["saved"]) and
+                        row.get("recovery_stage") == "contact_error" and
+                        (row.get("recovery_start") or {}).get("pattern") == list(pattern) for row in records)
+                        for pattern in (("outside", "outside"), ("inside", "inside"),
+                                        ("outside", "inside"), ("inside", "outside"))},
+                    "saved_by_low_offset_pattern": {"/".join(pattern): sum(bool(row["saved"]) and
+                        row.get("recovery_stage") == "low_offset" and
                         (row.get("recovery_start") or {}).get("pattern") == list(pattern) for row in records)
                         for pattern in (("outside", "outside"), ("inside", "inside"),
                                         ("outside", "inside"), ("inside", "outside"))},

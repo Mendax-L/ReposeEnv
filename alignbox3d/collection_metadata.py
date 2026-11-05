@@ -39,6 +39,6 @@ def metadata_dictionary(config, data_config=None):
         "heldout_visual_configs": (data_config["splits"]["validation"]["visuals"]
                                    if data_config is not None else list(HELDOUT_VISUAL_CONFIGS)),
         "heldout_policy": "Training excludes any matching rule. Attributes within a rule are ANDed; rules are ORed; omitted attributes are unrestricted. Validation examples and model demos must match a rule.",
-        "expert_labels": "Only successful contact-grasp demonstrations are saved. Recovery episodes begin at disturbed approach/carry states or measured wrong contact with both grippers laterally offset; grasp-ready episodes begin with the wall between open fingers immediately before closing. Mistake-making and grasp-ready setup actions are omitted. Per-frame stage instructions are defined in meta/language.json.",
+        "expert_labels": "Only successful contact-grasp demonstrations are saved. Recovery episodes begin at disturbed approach/carry states, measured wrong contact, or both grippers already lowered below the rim while laterally offset. Grasp-ready episodes begin with the wall between open fingers immediately before closing. Mistake-making and setup actions are omitted. Per-frame stage instructions are defined in meta/language.json.",
         "policy_inputs": "collection.* are experimental metadata, excluded from observation.state and action; existing image/state models ignore them.",
     }

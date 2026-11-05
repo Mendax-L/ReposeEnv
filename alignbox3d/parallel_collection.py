@@ -39,9 +39,14 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
         contact_error = recovery_draw < settings["contact_error_fraction"]
         grasp_ready = (not contact_error and recovery_draw <
                        settings["contact_error_fraction"]+settings["grasp_ready_fraction"])
+        low_offset = (not contact_error and not grasp_ready and recovery_draw <
+                      settings["contact_error_fraction"]+settings["grasp_ready_fraction"]+
+                      settings["low_offset_fraction"])
         recovery = bool(recovery_draw < settings["contact_error_fraction"]+
-                        settings["grasp_ready_fraction"]+settings["recovery_fraction"])
+                        settings["grasp_ready_fraction"]+settings["low_offset_fraction"]+
+                        settings["recovery_fraction"])
         recovery_stage = ("contact_error" if contact_error else "grasp_ready" if grasp_ready else
+                          "low_offset" if low_offset else
                           ("approach", "carry")[int(recovery_rng.integers(2))])
     else:
         recovery = mode != "normal"
@@ -57,7 +62,8 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
                                    max_steps=settings["max_steps"],
                                    recovery=recovery, recovery_offset_m=recovery_offset,
                                    recovery_stage=recovery_stage,
-                                   contact_error_lateral_m=settings["contact_error_lateral_mm"]/1000)
+                                   contact_error_lateral_m=settings["contact_error_lateral_mm"]/1000,
+                                   low_offset_m=settings["low_offset_mm"]/1000)
     result.update(attempt=attempt, initial_box_pose_world=initial,
                   initial_roll_pitch_rad=tilt.tolist(), initial_tool_offsets_m=tool_offsets.tolist(),
                   visual_parameters=environment.episode_metadata(),
@@ -99,7 +105,9 @@ def collection_attempts(environment, writer, args, config):
                 "recovery_offset_mm": args.recovery_offset_mm,
                 "contact_error_fraction": args.contact_error_fraction,
                 "grasp_ready_fraction": args.grasp_ready_fraction,
+                "low_offset_fraction": args.low_offset_fraction,
                 "contact_error_lateral_mm": args.contact_error_lateral_mm,
+                "low_offset_mm": args.low_offset_mm,
                 "visual_mode": args.visual_mode, "max_steps": args.max_steps}
     if args.workers == 1:
         def serial():

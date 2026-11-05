@@ -92,21 +92,24 @@ class GraspFailure(RuntimeError):
 class GraspCarryExpert:
     def __init__(self, environment, seed, *, config=None, step=None, max_steps=None,
                  recovery=False, recovery_offset_m=.010, recovery_stage="approach",
-                 contact_error_lateral_m=.019):
+                 contact_error_lateral_m=.019, low_offset_m=.035):
         self.environment = environment
         self.native = environment.environment
         self.config = config or GraspConfig()
         self.seed = int(seed)
         self.stage_instructions = sample_stage_instructions(self.seed)
         self.record_step = environment.step if step is None else step
-        if recovery_stage not in ("approach", "carry", "contact_error", "grasp_ready"):
-            raise ValueError("recovery_stage must be approach, carry, contact_error or grasp_ready")
+        if recovery_stage not in ("approach", "carry", "contact_error", "grasp_ready", "low_offset"):
+            raise ValueError("recovery_stage must be approach, carry, contact_error, grasp_ready or low_offset")
         if not math.isfinite(contact_error_lateral_m) or not .018 <= contact_error_lateral_m <= .020:
             raise ValueError("contact_error_lateral_m must be within 18-20 mm")
-        self.recovery = bool(recovery and (recovery_stage in ("contact_error", "grasp_ready") or recovery_offset_m > 0))
+        if not math.isfinite(low_offset_m) or not .025 <= low_offset_m <= .040:
+            raise ValueError("low_offset_m must be within 25-40 mm")
+        self.recovery = bool(recovery and (recovery_stage in ("contact_error", "grasp_ready", "low_offset") or recovery_offset_m > 0))
         self.recovery_stage = recovery_stage if self.recovery else None
         self.recovery_offset_m = float(recovery_offset_m)
         self.contact_error_lateral_m = float(contact_error_lateral_m)
+        self.low_offset_m = float(low_offset_m)
         self.recovery_start = None
         self.step_callback = environment.step if self.recovery else self.record_step
         self.max_steps = max_steps if max_steps is not None else math.ceil(100 / self.native.dt)
@@ -125,7 +128,8 @@ class GraspCarryExpert:
         if hasattr(environment, "collection_metadata"):
             environment.collection_metadata.update(
                 recovery_mode_id={None: 0, "approach": 1, "carry": 2,
-                                  "contact_error": 3, "grasp_ready": 4}[self.recovery_stage],
+                                  "contact_error": 3, "grasp_ready": 4,
+                                  "low_offset": 5}[self.recovery_stage],
                 grasp_points_box_m=self.sample["points_box_m"].tolist(),
                 grasp_angle_vectors_box_rad=self.sample["angle_vectors_box_rad"].tolist())
         self.grasp_relative_positions = self.grasp_relative_rotations = None
@@ -392,6 +396,43 @@ class GraspCarryExpert:
                                "wrong_tool_positions_world_m": n.tip_positions.tolist(),
                                "box_pose_world": n.data.qpos[n.box_qadr:n.box_qadr+7].copy().tolist()}
 
+    def create_low_offset(self, positions, grasp_rotations, approach_rotations, opening):
+        """Place both open grippers below the rim but on the wrong side of each wall."""
+        n = self.native
+        patterns = ((1, 1), (-1, -1), (1, -1), (-1, 1))
+        pattern = patterns[self.seed % len(patterns)]
+        rng = np.random.default_rng(np.random.SeedSequence([self.seed, 79]))
+        distances = rng.uniform(.025, self.low_offset_m, 2)
+        offset = np.asarray(pattern) * np.array([-1., 1.]) * distances
+        rotation = n.data.xmat[n.box_id].reshape(3, 3).copy()
+        wrong = positions + offset[:, None] * rotation[:, 0]
+        self.move_tools("approach_above", wrong+[0, 0, .09], approach_rotations, opening)
+        self.move_tools("approach_rim", wrong+[0, 0, .03], approach_rotations, opening)
+        self.move_tools("descend_to_grasp", wrong, grasp_rotations, opening,
+                        speed=self.config.contact_speed_m_s)
+        pads = self.contact_error_sides()
+        depths = n.box_highest_z - n.tip_positions[:, 2]
+        if (np.any(depths < .040) or
+                any(np.any(pads[arm]*pattern[arm] <= .006) for arm in range(2)) or
+                np.max(n.contact_forces) > .3):
+            raise GraspFailure("low_offset_not_clear_below_rim")
+        self.recovery_start = {"stage": "low_offset",
+                               "pattern": ["outside" if side == 1 else "inside" for side in pattern],
+                               "lateral_offset_m": offset.tolist(),
+                               "pad_offsets_from_wall_center_m": pads.tolist(),
+                               "tip_depth_below_rim_m": depths.tolist(),
+                               "contact_forces_N": n.contact_forces.copy().tolist(),
+                               "wrong_tool_positions_world_m": n.tip_positions.tolist(),
+                               "box_pose_world": n.data.qpos[n.box_qadr:n.box_qadr+7].copy().tolist()}
+
+    def recover_low_offset(self, opening):
+        """Lift vertically while laterally clear, then replan above the box."""
+        n = self.native
+        above = n.tip_positions.copy()
+        above[:, 2] = n.control_height+.15
+        self.move_tools("recover_contact", above, n.tip_rotations.copy(), opening,
+                        settle=False)
+
     def recover_contact(self, opening):
         """Clear the rim while retaining the current grasp orientation."""
         n = self.native
@@ -427,6 +468,11 @@ class GraspCarryExpert:
             self.create_contact_error(positions, grasp_rotations, approach_rotations, opening)
             self.start_recovery_recording()
             self.recover_contact(opening)
+            positions, grasp_rotations, approach_rotations = self.grasp_targets()
+        elif self.recovery_stage == "low_offset":
+            self.create_low_offset(positions, grasp_rotations, approach_rotations, opening)
+            self.start_recovery_recording()
+            self.recover_low_offset(opening)
             positions, grasp_rotations, approach_rotations = self.grasp_targets()
         elif self.recovery_stage == "grasp_ready":
             self.move_tools("approach_above", positions+[0,0,.09], approach_rotations, opening)
@@ -524,6 +570,7 @@ class GraspCarryExpert:
                 "recovery": self.recovery, "recovery_stage": self.recovery_stage,
                 "recovery_start": self.recovery_start,
                 "contact_error_lateral_m": self.contact_error_lateral_m,
+                "low_offset_m": self.low_offset_m,
                 "config": asdict(self.config), "stage_frames": self.stage_counts,
                 "stage_trace": self.trace, "frames": self.frames, "peak_lift_m": self.peak_lift_m,
                 "max_finger_box_penetration_m": self.native.max_finger_box_penetration_m,
@@ -537,13 +584,14 @@ class GraspCarryExpert:
 
 def collect_grasp_episode(environment, writer, seed, *, config=None, max_steps=None,
                           recovery=False, recovery_offset_m=.010, recovery_stage="approach",
-                          contact_error_lateral_m=.019):
+                          contact_error_lateral_m=.019, low_offset_m=.035):
     recorder = EpisodeRecorder(environment, buffer_dir=getattr(writer, "root", None))
     expert = GraspCarryExpert(environment, seed, config=config, step=recorder.step,
                              max_steps=max_steps, recovery=recovery,
                              recovery_offset_m=recovery_offset_m,
                              recovery_stage=recovery_stage,
-                             contact_error_lateral_m=contact_error_lateral_m)
+                             contact_error_lateral_m=contact_error_lateral_m,
+                             low_offset_m=low_offset_m)
     try:
         try:
             result = expert.run()
