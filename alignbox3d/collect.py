@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--max-attempts", type=int, help="Default: five attempts per requested success.")
     parser.add_argument("--data-config", type=Path, default=DEFAULT_DATA_CONFIG, help="Shared training/validation scene config (JSON syntax in a legacy .yml file).")
     parser.add_argument("--split", choices=("train", "validation"), default="train")
-    parser.add_argument("--episode-mode", choices=("mixed", "normal", "offset_recovery", "contact_error"),
+    parser.add_argument("--episode-mode", choices=("mixed", "normal", "offset_recovery", "contact_error", "grasp_ready"),
                         default="mixed", help="Force one trajectory type per output directory; mixed uses the recovery fractions.")
     parser.add_argument("--seed", type=int, help="First attempt seed; defaults to the selected split's range start.")
     parser.add_argument("--render-size", type=int, default=256)
@@ -60,9 +60,11 @@ def main():
     parser.add_argument("--recovery-offset-mm", type=float, default=10.,
                         help="Maximum approach-tool or held-box displacement for recovery demonstrations.")
     parser.add_argument("--contact-error-fraction", type=float, default=0.,
-                        help="Fraction of attempts starting from a real one-sided wrong box contact before regrasping.")
-    parser.add_argument("--contact-error-height-mm", type=float, default=20.,
-                        help="Maximum height error of the gripper that presses the box, 10-25 mm.")
+                        help="Fraction of attempts starting from measured wrong box contact with both grippers laterally offset.")
+    parser.add_argument("--grasp-ready-fraction", type=float, default=0.,
+                        help="Fraction of attempts recorded from a verified rim-between-fingers pose, immediately before closing.")
+    parser.add_argument("--contact-error-lateral-mm", type=float, default=19.,
+                        help="Both grippers' box-local lateral offsets for failed contact, 18-20 mm.")
     parser.add_argument("--lift-mm", type=float, default=20.)
     args = parser.parse_args()
     try:
@@ -86,15 +88,16 @@ def main():
     if not np.isfinite(args.initial_tilt_deg) or not 0 <= args.initial_tilt_deg <= 5:
         parser.error("initial-tilt-deg must be within [0,5].")
     if (not np.isfinite([args.initial_tool_jitter_mm, args.recovery_fraction,
-                         args.recovery_offset_mm, args.contact_error_fraction,
-                         args.contact_error_height_mm]).all()
+                         args.recovery_offset_mm, args.contact_error_fraction, args.grasp_ready_fraction,
+                         args.contact_error_lateral_mm]).all()
             or not 0 <= args.initial_tool_jitter_mm <= 15
             or not 0 <= args.recovery_fraction <= 1
             or not 0 <= args.contact_error_fraction <= 1
-            or args.recovery_fraction+args.contact_error_fraction > 1
+            or not 0 <= args.grasp_ready_fraction <= 1
+            or args.recovery_fraction+args.contact_error_fraction+args.grasp_ready_fraction > 1
             or not 0 <= args.recovery_offset_mm <= 15
-            or not 10 <= args.contact_error_height_mm <= 25):
-        parser.error("Jitter/offset must be 0-15 mm; contact error height 10-25 mm; recovery fractions must sum to at most 1.")
+            or not 18 <= args.contact_error_lateral_mm <= 20):
+        parser.error("Jitter/offset must be 0-15 mm; contact error lateral offset 18-20 mm; recovery fractions must sum to at most 1.")
     try:
         config = GraspConfig(point_y_range_m=args.grasp_y_mm/1000,
             point_z_range_m=args.grasp_z_mm/1000, pair_y_difference_m=args.pair_y_difference_mm/1000,
@@ -138,8 +141,9 @@ def main():
             "recovery_fraction": args.recovery_fraction,
             "recovery_offset_mm": args.recovery_offset_mm,
             "contact_error_fraction": args.contact_error_fraction,
-            "contact_error_height_mm": args.contact_error_height_mm,
-            "recovery_sampling": "Recovery episodes begin recording after an unrecorded approach/carry displacement or measured one-sided wrong box contact. Contact-error episodes record opening, withdrawal, replanning, regrasp and final success; mistake-making actions are excluded.",
+            "grasp_ready_fraction": args.grasp_ready_fraction,
+            "contact_error_lateral_mm": args.contact_error_lateral_mm,
+            "recovery_sampling": "Recovery episodes begin recording after an unrecorded approach/carry displacement or measured wrong box contact. Both grippers are offset outside/inside their walls in four deterministic combinations; finger-pad geometry is checked before saving. Contact-error episodes record withdrawal, replanning, regrasp and final success; mistake-making actions are excluded. Grasp-ready episodes begin with both walls between fingers and immediately close.",
             "acceptance": "physical lift, aligned placement, open grippers, withdrawal and stable released alignment",
             "selection_bias": "only physically successful and reachable attempts are saved; all rejected attempts remain in collection.json"}
         provenance = {"kind": "scripted_contact_grasp_carry_release", "human_demonstration": False,
@@ -173,7 +177,11 @@ def main():
                     "attempts": len(records), "failed_attempts": len(records)-saved,
                     "saved_by_recovery_stage": {name: sum(bool(row["saved"]) and
                         (row.get("recovery_stage") or "none") == name for row in records)
-                        for name in ("none", "approach", "carry", "contact_error")},
+                        for name in ("none", "approach", "carry", "contact_error", "grasp_ready")},
+                    "saved_by_contact_pattern": {"/".join(pattern): sum(bool(row["saved"]) and
+                        (row.get("recovery_start") or {}).get("pattern") == list(pattern) for row in records)
+                        for pattern in (("outside", "outside"), ("inside", "inside"),
+                                        ("outside", "inside"), ("inside", "outside"))},
                     "workers": args.workers, "split": args.split, "ordering": "seed_ascending",
                     "complete": saved == args.episodes, "episodes": records})
                 print(json.dumps({key: result.get(key) for key in

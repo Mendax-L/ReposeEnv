@@ -36,22 +36,22 @@ ReposeEnv/
 
 ## 自动采集
 
-流程为：接近 → 渐进加紧 → 抬起 → 搬运对齐 → 放下 → 渐进松开并撤离 → 稳定验收。每步控制两个末端和夹爪，箱体通过真实碰撞接触运动。只保存成功示范；指定 `--output` 时目录必须尚不存在；未指定时使用带时间戳的默认目录。默认对每只夹爪的停放位姿独立施加各轴 ±8 mm 扰动。`--episode-mode mixed` 按 `--recovery-fraction` 和 `--contact-error-fraction` 概率采样恢复类型；错误抵箱概率默认是 0。下方生产配方使用混合模式，并将错误抵箱尝试概率设为 20%。
+流程为：接近 → 渐进加紧 → 抬起 → 搬运对齐 → 放下 → 渐进松开并撤离 → 稳定验收。每步控制两个末端和夹爪，箱体通过真实碰撞接触运动。只保存成功示范；指定 `--output` 时目录必须尚不存在；未指定时使用带时间戳的默认目录。默认对每只夹爪的停放位姿独立施加各轴 ±8 mm 扰动。`--episode-mode mixed` 按 `--recovery-fraction`、`--contact-error-fraction` 和 `--grasp-ready-fraction` 概率采样类型。下方生产配方使用 20% 错误抵箱和 20% 抓取就绪的尝试比例。
 
-训练集和验证集共用 `config/alignbox3d_data.yml`。当前 π₀.₅ 生产配方在各 split 内混合正常与错误抵箱恢复轨迹，训练共 200 条、验证共 24 条：
+训练集和验证集共用 `config/alignbox3d_data.yml`。当前 π₀.₅ 生产配方在各 split 内混合完整正常、错误抵箱恢复和抓取就绪轨迹，训练共 200 条、验证共 24 条：
 
 ```powershell
-python -m alignbox3d.collect --split train --episodes 200 --workers 4 --seed 500000 --recovery-fraction 0 --contact-error-fraction 0.20 --output training_data/lerobot/alignbox3d/pi05_train
-python -m alignbox3d.collect --split validation --episodes 24 --workers 4 --seed 900000 --recovery-fraction 0 --contact-error-fraction 0.20 --output training_data/lerobot/alignbox3d/pi05_validation
+python -m alignbox3d.collect --split train --episodes 200 --workers 4 --seed 500000 --recovery-fraction 0 --contact-error-fraction 0.20 --grasp-ready-fraction 0.20 --output training_data/lerobot/alignbox3d/pi05_train
+python -m alignbox3d.collect --split validation --episodes 24 --workers 4 --seed 900000 --recovery-fraction 0 --contact-error-fraction 0.20 --grasp-ready-fraction 0.20 --output training_data/lerobot/alignbox3d/pi05_validation
 ```
 
-采集完成后，使用 [Pi05AlignBox3D 的完整 recipe](../Pi05AlignBox3D/README.md) 导出固定高层任务数据，并从 LeRobot 的 `lerobot/pi05_base` 微调 π₀.₅。首轮训练设置为 3000 步、只在末步保存 checkpoint。原始轨迹的阶段句子仅供导出时校验，不直接作为模型训练指令。
+采集完成后，使用 [Pi05AlignBox3D 的完整 recipe](../Pi05AlignBox3D/README.md) 导出固定高层任务数据，并从 LeRobot 的 `lerobot/pi05_base` 微调 π₀.₅。正式 recipe 使用 20000 步并每 5000 步保存 checkpoint；原来的 3000 步仅适合作为流程预检。原始轨迹的阶段句子仅供导出时校验，不直接作为模型训练指令。
 
 `--data-config` 可指定另一份同结构配置。当前 `.yml` 文件内容必须使用 **JSON 语法**，由 Python 标准库 `json` 解析；后缀是历史命名，不能直接写成普通 YAML 缩进语法。采集前可运行 `python -m json.tool config/alignbox3d_data.yml > /dev/null` 检查语法。文件声明相机/光照随机范围、两侧的 `[start, stop)` seed 范围以及验证专用搭配规则。默认训练范围 `[500000,900000)`、验证范围 `[900000,1000000)`；采集器拒绝越界种子，工作进程使用同一配置。训练侧排除所有匹配 `holdout_rules` 的搭配，验证侧按 `visuals` 样例顺序轮换。配置和实际 split 保存到 `meta/data_split.json`、schema 和采集报告中。训练和验证使用不重叠 seed 段，避免重复物理场景。
 
-`--workers` 默认 1，设为 4 即启动四个独立仿真进程。主进程按 seed 顺序合并成功轨迹，重新生成全局编号和统计，视频直接复制。`--episodes` 指成功条数；失败只记录到 `meta/collection.json`。达到 `--max-attempts` 仍不足目标时保留已成功的数据并报错；默认最多尝试成功目标条数的五倍。上述配方对尝试按 80% 正常、20% 错误抵箱重抓采样，成功筛选会改变落盘比例；检查 `meta/collection.json` 的 `saved_by_recovery_stage`，确认两类数据都存在。逐帧 `collection.recovery_mode_id` 为 0 正常、1 接近偏移、2 持箱偏移、3 错误抵箱重抓，属于采集元数据，不进入模型输入。
+`--workers` 默认 1，设为 4 即启动四个独立仿真进程。主进程按 seed 顺序合并成功轨迹，重新生成全局编号和统计，视频直接复制。`--episodes` 指成功条数；失败只记录到 `meta/collection.json`。达到 `--max-attempts` 仍不足目标时保留已成功的数据并报错；默认最多尝试成功目标条数的五倍。上述配方对尝试按 60% 完整正常、20% 错误抵箱重抓、20% 抓取就绪采样；连续 20 个 seed 分层轮换，使四种横向错误组合均能被抽到。成功筛选会改变落盘比例；检查 `meta/collection.json` 的 `saved_by_recovery_stage` 和 `saved_by_contact_pattern`。逐帧 `collection.recovery_mode_id` 为 0 正常、1 接近偏移、2 持箱偏移、3 错误抵箱重抓、4 抓取就绪，属于采集元数据，不进入模型输入。
 
-抓点在上箱局部坐标系中采样：各自前后偏移 ±10 mm、高度偏移 ±5 mm，两点前后差 ≤2 mm、高度差 ≤5 mm。夹持朝向共享扰动各轴 ±1.5°，每臂再加各轴 ±0.25°；初始箱体 roll/pitch 各 ±2°，允许通过 `--initial-tilt-deg` 调到最大 5°。夹爪起点扰动可用 `--initial-tool-jitter-mm` 调整到 0–15 mm。`--recovery-fraction` 与 `--contact-error-fraction` 分别控制接近/持箱偏移和错误抵箱重抓的尝试比例，两者之和不得超过 1。错误抵箱时只闭合一侧夹爪，必须测得该侧箱体接触力至少 1 N、另一侧不超过 0.3 N；从此状态开始录制松开、退出箱沿、重新规划、重抓和最终对齐。制造错误接触的动作不进入训练。相同 seed 复现初态、抓点与恢复场景；重力稳定后按实测箱体姿态规划。
+抓点在上箱局部坐标系中采样：各自前后偏移 ±10 mm、高度偏移 ±5 mm，两点前后差 ≤2 mm、高度差 ≤5 mm。完整正常和错误恢复轨迹的夹持倾角每条采样 20–25°，共享扰动各轴 ±1.5°，每臂再加各轴 ±0.25°；从箱沿上方到闭合保持同一夹持方向。抓取就绪轨迹从箱沿已处于两指之间、下一步直接闭合的状态录制，半数为近垂直的 10°，半数为 20–25°；就绪初态之前的预定位动作不进入训练。初始箱体 roll/pitch 各 ±2°，允许通过 `--initial-tilt-deg` 调到最大 5°。夹爪起点扰动可用 `--initial-tool-jitter-mm` 调整到 0–15 mm。三个 fraction 分别控制偏移恢复、错误抵箱和抓取就绪的尝试比例，三者之和不得超过 1。错误抵箱时两只夹爪分别沿各自箱壁局部横向偏移 19 mm，按 seed 轮换外/外、内/内、外/内、内/外四种组合；必须测得至少一侧接触力 ≥1 N，并校验两只夹爪的指垫中心均处于对应箱壁的同一侧，避免把已经夹住箱壁的状态误标为失败。此后录制退出、重新抓取和最终对齐；制造错误接触的动作不进入训练。相同 seed 复现初态、抓点与恢复场景；重力稳定后按实测箱体姿态规划。
 
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
@@ -66,7 +66,8 @@ python -m alignbox3d.collect --split validation --episodes 24 --workers 4 --seed
 | `--lift-mm` | 20 | 箱体几何中心的规划抬升量 |
 | `--initial-tool-jitter-mm` | 8 | 双夹爪停放位置各 XYZ 轴独立扰动范围，单位 mm |
 | `--recovery-fraction` / `--recovery-offset-mm` | 0.25 / 10 | 尝试恢复采样的概率与偏离幅度上限 |
-| `--contact-error-fraction` / `--contact-error-height-mm` | 0 / 20 | 错误抵箱重抓的尝试概率与错误抓点高度上限；高度范围 10–25 mm |
+| `--contact-error-fraction` / `--contact-error-lateral-mm` | 0 / 19 | 错误抵箱重抓的尝试概率与两臂横向偏移；范围 18–20 mm |
+| `--grasp-ready-fraction` | 0 | 从箱沿已在两指之间的就绪状态开始录制的尝试概率 |
 
 夹爪用五次平滑曲线渐进开合，默认 12 mm 行程变化约需 5.6 s，再停稳至少 0.4 s。闭合时箱体异常升起超过 1.5 mm 或峰值速度超过 25 mm/s，该尝试会被拒绝。运动默认不启用额外加速度限制；需要时用 `--acceleration-mm-s2` 指定。其余随机范围和选项见 `python -m alignbox3d.collect --help`。
 

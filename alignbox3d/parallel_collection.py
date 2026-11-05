@@ -31,12 +31,17 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
     tool_jitter = settings["initial_tool_jitter_mm"] / 1000
     tool_offsets = tool_rng.uniform(-tool_jitter, tool_jitter, (2, 3))
     recovery_rng = np.random.default_rng(np.random.SeedSequence([seed, 75]))
-    recovery_draw = recovery_rng.random()
+    # Visit all 20 strata once per 20 consecutive seeds. With the production
+    # 20%/20% mix this also visits each of the four contact patterns once.
+    recovery_draw = ((seed*13) % 20 + recovery_rng.random()) / 20
     mode = settings["episode_mode"]
     if mode == "mixed":
         contact_error = recovery_draw < settings["contact_error_fraction"]
-        recovery = bool(recovery_draw < settings["contact_error_fraction"]+settings["recovery_fraction"])
-        recovery_stage = ("contact_error" if contact_error else
+        grasp_ready = (not contact_error and recovery_draw <
+                       settings["contact_error_fraction"]+settings["grasp_ready_fraction"])
+        recovery = bool(recovery_draw < settings["contact_error_fraction"]+
+                        settings["grasp_ready_fraction"]+settings["recovery_fraction"])
+        recovery_stage = ("contact_error" if contact_error else "grasp_ready" if grasp_ready else
                           ("approach", "carry")[int(recovery_rng.integers(2))])
     else:
         recovery = mode != "normal"
@@ -52,7 +57,7 @@ def run_attempt(environment, writer, seed, attempt, settings, config):
                                    max_steps=settings["max_steps"],
                                    recovery=recovery, recovery_offset_m=recovery_offset,
                                    recovery_stage=recovery_stage,
-                                   contact_error_height_m=settings["contact_error_height_mm"]/1000)
+                                   contact_error_lateral_m=settings["contact_error_lateral_mm"]/1000)
     result.update(attempt=attempt, initial_box_pose_world=initial,
                   initial_roll_pitch_rad=tilt.tolist(), initial_tool_offsets_m=tool_offsets.tolist(),
                   visual_parameters=environment.episode_metadata(),
@@ -93,7 +98,8 @@ def collection_attempts(environment, writer, args, config):
                 "recovery_fraction": args.recovery_fraction,
                 "recovery_offset_mm": args.recovery_offset_mm,
                 "contact_error_fraction": args.contact_error_fraction,
-                "contact_error_height_mm": args.contact_error_height_mm,
+                "grasp_ready_fraction": args.grasp_ready_fraction,
+                "contact_error_lateral_mm": args.contact_error_lateral_mm,
                 "visual_mode": args.visual_mode, "max_steps": args.max_steps}
     if args.workers == 1:
         def serial():
